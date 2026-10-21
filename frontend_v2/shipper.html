@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>货主端 · 发布与跟踪</title>
+<link rel="stylesheet" href="/app.css?v=20261018g">
+</head>
+<body>
+<div class="wrap">
+  <header class="page-head">
+    <div class="page-head-main">
+      <h1>我的运输</h1>
+      <p>说清楚要运什么、从哪到哪、什么时候要、预算多少，订单助手会帮你把需求整理成一张可执行的运单。</p>
+      <div class="page-chips">
+        <span class="chip">信息不全先追问</span>
+        <span class="chip">确认后才下单</span>
+        <span class="chip">全程可查进度</span>
+      </div>
+    </div>
+    <div class="hero-graphic" aria-hidden="true">
+      <span class="hg-dot"></span><span class="hg-line"></span>
+      <span class="hg-dot mid"></span><span class="hg-line"></span>
+      <span class="hg-dot end"></span>
+    </div>
+  </header>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="panel-title"><h2>跟订单助手说需求</h2></div>
+      <div id="chat" class="chat"></div>
+      <div class="ag-chips" id="quick"></div>
+      <div class="chat-input">
+        <input id="text" placeholder="例如：石家庄到南京 冷链 8 吨，明天下午 6 点前到，预算 1.2 万">
+        <button class="primary" id="send">发送</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="panel-title"><h2>我的订单</h2><span class="spacer"></span>
+        <button class="small" id="refresh">刷新</button></div>
+      <div id="orders"><div class="empty">加载中…</div></div>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js?v=20261018g"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const user = Auth.require("shipper");
+mountTopbar("货主端 · 发布与跟踪");
+let sessionId = null;
+const chat = $("chat");
+
+pushMsg(chat, "agent", "你好，我是订单助手。说说这趟货：从哪里发、送到哪、什么货、多少吨、最晚什么时候到、预算上限多少。说不全没关系，我会逐项问。");
+
+const CANCELLABLE = ["submitted", "planned", "published", "candidate",
+                     "claimed", "in_transit", "exception"];
+
+/* ---------------- 列表 ---------------- */
+function renderOrders(rows) {
+  const box = $("orders");
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">还没有订单，先在左边发布一条需求</div>';
+    return;
+  }
+  box.innerHTML = '<table><thead><tr><th>订单号</th><th>线路</th><th>货物</th><th>状态</th>' +
+    '<th></th></tr></thead><tbody>' +
+    rows.map(r => '<tr><td><button class="link" data-open="' + r.id + '">' + esc(r.order_no) +
+      '</button></td><td>' + esc(r.origin) + ' → ' + esc(r.dest) + '</td><td>' +
+      esc(r.cargo_type) + ' ' + (r.weight_t ?? "-") + '吨</td>' +
+      '<td>' + statusTag(r.status, r.status_label) + '</td>' +
+      '<td class="row-actions">' + (CANCELLABLE.includes(r.status)
+        ? '<button class="small danger" data-cancel="' + r.id + '" data-no="' + esc(r.order_no) +
+          '">取消</button>' : '') + '</td></tr>').join("") +
+    '</tbody></table>';
+
+  box.querySelectorAll("button[data-open]").forEach(b => {
+    b.onclick = () => openOrder(Number(b.dataset.open));
+  });
+  box.querySelectorAll("button[data-cancel]").forEach(b => {
+    b.onclick = () => doCancel(Number(b.dataset.cancel), b.dataset.no, loadOrders);
+  });
+}
+
+async function loadOrders() {
+  try { renderOrders(await api("/api/shipper/orders")); }
+  catch (e) { $("orders").innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+
+/* ---------------- 订单详情 ---------------- */
+function routeChain(d) {
+  const wp = (d.plan && d.plan.waypoints) || [];
+  if (!wp.length) {
+    return '<div class="route-chain"><span class="rc-node end">' + esc(d.origin) +
+      '</span><span class="rc-sep">→</span><span class="rc-node end">' + esc(d.dest) + '</span></div>';
+  }
+  return '<div class="route-chain">' + wp.map((n, i) => {
+    const end = i === 0 || i === wp.length - 1;
+    return '<span class="rc-node' + (end ? " end" : "") + '">' + esc(n) + '</span>' +
+      (i < wp.length - 1 ? '<span class="rc-sep">→</span>' : "");
+  }).join("") + '</div>';
+}
+
+function moneyBlock(d) {
+  const items = [];
+  if (d.budget_max != null) items.push({ label: "预算上限", value: money(d.budget_max) });
+  if (d.publish) {
+    items.push({ label: "平台服务费", value: "−" + money(d.publish.shipper_fee) });
+    items.push({ label: "实际承运价", value: money(d.publish.publish_price), strong: true });
+  }
+  if (!items.length) return '<div class="muted">暂无费用信息</div>';
+  return amountList(items);
+}
+
+async function openOrder(id) {
+  try {
+    const d = await api("/api/shipper/orders/" + id);
+    const plan = d.plan || {};
+    const body =
+      '<div class="detail-hero"><div class="dh-main">' +
+        '<div class="dh-no">' + esc(d.order_no) + '</div>' +
+        '<div class="dh-sub">' + esc(d.origin) + " → " + esc(d.dest) + '</div>' +
+      '</div>' + statusTag(d.status, d.status_label) + '</div>' +
+
+      detailSection("费用", moneyBlock(d)) +
+
+      detailSection("路线", routeChain(d) +
+        (plan.distance_km ? '<div class="muted" style="margin-top:8px">全程 ' + plan.distance_km +
+          ' km · 预计 ' + (plan.eta_h ?? "-") + ' 小时</div>' : '')) +
+
+      detailSection("货物", kvGrid([
+        ["货类", esc(d.cargo_type)],
+        ["重量", (d.weight_t ?? "-") + " 吨"],
+        ["温控", d.temp_ctrl ? "需要" : "不需要"],
+        ["危险品", d.hazmat ? "是" : "否"],
+        ["要求送达", esc(d.required_by || "-")],
+      ])) +
+
+      detailSection("承运与联系", kvGrid([
+        ["承运商", esc(d.carrier_org || "尚未接单")],
+        ["联系人", esc(d.contact_name || "-")],
+        ["联系电话", esc(d.contact_phone || "-")],
+        ["下单时间", esc(d.created_at || "-")],
+      ])) +
+
+      detailSection("流转记录", eventTimeline(d.events));
+
+    const foot = CANCELLABLE.includes(d.status)
+      ? '<button class="danger" id="dCancel">取消订单</button>' : "";
+    const mask = openDrawer("订单详情", body, foot);
+    const btn = mask.querySelector("#dCancel");
+    if (btn) btn.onclick = () => doCancel(d.id, d.order_no, () => { closeDrawer(); loadOrders(); });
+  } catch (e) { toast(e.message); }
+}
+
+function doCancel(id, no, after) {
+  askReason("取消订单 " + no, "取消后订单进入终态，已接单的承运商会被释放。")
+    .then(async (reason) => {
+      if (!reason) return;
+      try {
+        await api("/api/shipper/orders/" + id + "/cancel", { method: "POST", body: { reason } });
+        toast("已取消");
+        if (after) after();
+      } catch (e) { toast(e.message); }
+    });
+}
+
+/* ---------------- 对话 ---------------- */
+const SID_KEY = "sca_sid_shipper";
+
+// 刷新页面不该丢上下文：会话在服务端，本地只记 id
+async function restoreChat() {
+  const sid = localStorage.getItem(SID_KEY);
+  if (!sid) return;
+  try {
+    const rows = await api("/api/shipper/chat/" + encodeURIComponent(sid));
+    if (!rows || !rows.length) { localStorage.removeItem(SID_KEY); return; }
+    chat.innerHTML = "";
+    rows.forEach(m => pushMsg(chat, m.role === "user" ? "user" : "agent", m.content));
+    pushMsg(chat, "sys", "已恢复上次未结束的对话，可以接着说。");
+    sessionId = sid;
+  } catch (e) {
+    localStorage.removeItem(SID_KEY);
+  }
+}
+
+async function send() {
+  const t = $("text").value.trim();
+  if (!t) return;
+  $("text").value = "";
+  pushMsg(chat, "user", t);
+  $("send").disabled = true;
+  try {
+    const r = await api("/api/shipper/chat", {
+      method: "POST", body: { session_id: sessionId, text: t },
+    });
+    sessionId = r.session_id;
+    if (sessionId) localStorage.setItem(SID_KEY, sessionId);
+    pushMsg(chat, "agent", r.reply);
+    // 服务端给了可选值就换成按钮（例如货类清单），否则回到默认快捷问题
+    mountChips((r.data && r.data.options) || null);
+    if (r.done) {
+      pushMsg(chat, "sys", "本单已提交。继续说下一单即可开始新会话。");
+      sessionId = null;
+      localStorage.removeItem(SID_KEY);
+      mountChips();
+      loadOrders();
+    }
+  } catch (e) {
+    pushMsg(chat, "sys", "出错了：" + e.message);
+  } finally {
+    $("send").disabled = false;
+    $("text").focus();
+  }
+}
+
+const QUICK = [
+  ["有什么货类", "有什么货类"],
+  ["冷链要注意什么", "冷链货物运输要注意什么"],
+  ["多久能到", "这单多久能到"],
+  ["费用怎么算", "费用怎么算"],
+];
+
+/* 快捷回复条：既能挂固定问题，也能挂服务端返回的可选值。
+   后端在「有什么货类」「同一项问第二遍」时会给 data.options，
+   渲染成按钮让人点一下就发出去——比让人对着输入框猜一个词快得多。 */
+function mountChips(labels) {
+  const box = $("quick");
+  if (!box) return;
+  const items = (labels && labels.length) ? labels.map(x => [x, x]) : QUICK;
+  box.innerHTML = items.map((q, i) =>
+    '<button class="ag-chip" data-q="' + i + '">' + esc(q[0]) + "</button>").join("");
+  box.querySelectorAll("button[data-q]").forEach(b => {
+    b.onclick = () => { $("text").value = items[Number(b.dataset.q)][1]; send(); };
+  });
+}
+mountChips();
+
+$("send").onclick = send;
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+$("refresh").onclick = loadOrders;
+loadOrders();
+restoreChat();
+</script>
+</body>
+</html>

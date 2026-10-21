@@ -1,0 +1,26 @@
+[project]
+name = "supply-chain-agent"
+version = "0.1.0"
+description = "供应链多智能体调度与异常处理系统（开发验证原型）"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.60",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "mcp>=1.4",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-dotenv>=1.0",
+    "redis>=5.2,<6.0",
+]
+
+[project.scripts]
+sca-demo = "sca.demo:main"
+sca-tms = "sca.mcp.tms_server:run"
+
+[tool.setuptools.packages.find]
+include = ["sca*"]

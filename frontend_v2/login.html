@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · 供应链三平台调度系统</title>
+<link rel="stylesheet" href="/app.css?v=20261018g">
+</head>
+<body>
+<div class="auth-shell">
+  <aside class="auth-brand">
+    <div class="ab-logo">
+      <div class="mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="5" cy="6" r="2.1"/><circle cx="19" cy="18" r="2.1"/>
+          <path d="M7.1 6H13a3.4 3.4 0 0 1 0 6.8H9.4a3.2 3.2 0 0 0 0 6.4H17"/>
+        </svg>
+      </div>
+      <div>
+        <div class="name">供应链调度平台</div>
+        <div class="sub">三端协同 · 订单全流程可追溯</div>
+      </div>
+    </div>
+
+    <h2>让每一车货，<br>都在同一条链上跑完。</h2>
+    <p class="lead">
+      从发布需求到签收结算，路线、时效、费用和异常都在一个地方交接，
+      不用再靠电话和表格来回对账。
+    </p>
+
+    <div class="auth-flow" aria-hidden="true">
+      <div class="af-node"><span class="af-dot"></span><b>货主发布</b></div>
+      <span class="af-line"></span>
+      <div class="af-node"><span class="af-dot"></span><b>平台调度</b></div>
+      <span class="af-line"></span>
+      <div class="af-node"><span class="af-dot"></span><b>承运交付</b></div>
+    </div>
+  </aside>
+
+  <main class="auth-main">
+    <div class="auth-box">
+      <div class="card">
+        <h2 id="title">登录</h2>
+        <p class="auth-lead" id="leadText">用账号密码登录，并填写右侧图片中的字符。</p>
+
+        <div class="tabs">
+          <button id="tabLogin" class="primary" type="button">登录</button>
+          <button id="tabReg" type="button">注册</button>
+        </div>
+
+        <form id="formLogin">
+          <label class="first-label">账号</label>
+          <input id="lAcc" autocomplete="username" placeholder="请输入账号">
+          <label>密码</label>
+          <input id="lPwd" type="password" autocomplete="current-password" placeholder="请输入密码">
+          <label>验证码</label>
+          <div class="code-row">
+            <input id="lCode" maxlength="4" autocomplete="off" spellcheck="false"
+                   placeholder="输入图中 4 位字符">
+            <img id="lCapImg" class="captcha-img" alt="验证码" title="点击换一张">
+          </div>
+          <div class="muted cap-hint" id="lHint">看不清？点击图片换一张</div>
+          <div class="muted auth-switch">登录后按账号所属平台自动进入：货主 / 调度 / 承运 / 管理</div>
+          <div style="margin-top:18px">
+            <button class="primary" style="width:100%" type="submit">登录</button>
+          </div>
+        </form>
+
+        <form id="formReg" style="display:none">
+          <label class="first-label">账号</label>
+          <input id="rAcc" placeholder="字母、数字、下划线，3-64 位">
+          <label>密码</label>
+          <input id="rPwd" type="password" placeholder="至少 6 位">
+          <label>姓名</label>
+          <input id="rName" placeholder="真实姓名或称呼">
+          <label>角色</label>
+          <select id="rRole">
+            <option value="shipper">货主</option>
+            <option value="carrier">承运商</option>
+            <option value="dispatcher">调度员</option>
+          </select>
+          <label>企业 / 车队名称</label>
+          <input id="rOrg" placeholder="货主写公司名，承运商写车队名，调度员写所属平台">
+          <label>手机号（可选）</label>
+          <input id="rPhone" placeholder="仅用于联系，不参与登录">
+          <label>验证码</label>
+          <div class="code-row">
+            <input id="rCode" maxlength="4" autocomplete="off" spellcheck="false"
+                   placeholder="输入图中 4 位字符">
+            <img id="rCapImg" class="captcha-img" alt="验证码" title="点击换一张">
+          </div>
+          <div class="muted cap-hint" id="rHint">看不清？点击图片换一张</div>
+          <div style="margin-top:18px">
+            <button class="primary" style="width:100%" type="submit">注册并登录</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/common.js?v=20261018g"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const cap = { login: { cid: "" }, register: { cid: "" } };
+
+function switchTo(reg) {
+  $("formLogin").style.display = reg ? "none" : "";
+  $("formReg").style.display = reg ? "" : "none";
+  $("tabLogin").className = reg ? "" : "primary";
+  $("tabReg").className = reg ? "primary" : "";
+  $("title").textContent = reg ? "注册" : "登录";
+  $("leadText").textContent = reg
+    ? "创建账号：填写角色与企业名称，验证码校验通过后自动登录。"
+    : "用账号密码登录，并填写右侧图片中的字符。";
+  loadCaptcha(reg ? "register" : "login");
+}
+$("tabLogin").onclick = () => switchTo(false);
+$("tabReg").onclick = () => switchTo(true);
+
+async function loadCaptcha(purpose) {
+  const img = $(purpose === "login" ? "lCapImg" : "rCapImg");
+  const input = $(purpose === "login" ? "lCode" : "rCode");
+  const hint = $(purpose === "login" ? "lHint" : "rHint");
+  img.removeAttribute("src");
+  img.classList.add("loading");
+  try {
+    const r = await api("/api/auth/captcha?purpose=" + purpose);
+    cap[purpose].cid = r.cid;
+    img.src = r.image;
+    if (input) input.value = "";
+    if (hint) hint.textContent = "看不清？点击图片换一张";
+  } catch (e) {
+    if (hint) hint.textContent = "验证码加载失败：" + e.message;
+  } finally {
+    img.classList.remove("loading");
+  }
+}
+
+$("lCapImg").onclick = () => loadCaptcha("login");
+$("rCapImg").onclick = () => loadCaptcha("register");
+
+$("formLogin").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (!cap.login.cid) { toast("验证码未加载，请稍候"); loadCaptcha("login"); return; }
+  try {
+    const r = await api("/api/auth/login", {
+      method: "POST",
+      body: {
+        account: $("lAcc").value.trim(), password: $("lPwd").value,
+        code: $("lCode").value.trim(), cid: cap.login.cid,
+      },
+    });
+    Auth.save(r.token, r.user);
+    location.href = r.home;
+  } catch (e) {
+    toast(e.message);
+    loadCaptcha("login");   // 答错或过期：后端已作废这张图，必须换新的
+  }
+};
+
+$("formReg").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (!cap.register.cid) { toast("验证码未加载，请稍候"); loadCaptcha("register"); return; }
+  try {
+    const r = await api("/api/auth/register", {
+      method: "POST",
+      body: {
+        account: $("rAcc").value.trim(), password: $("rPwd").value,
+        display_name: $("rName").value.trim(), role: $("rRole").value,
+        org_name: $("rOrg").value.trim(),
+        phone: $("rPhone").value.trim() || null,
+        code: $("rCode").value.trim(), cid: cap.register.cid,
+      },
+    });
+    Auth.save(r.token, r.user);
+    location.href = r.home;
+  } catch (e) {
+    toast(e.message);
+    loadCaptcha("register");
+  }
+};
+
+loadCaptcha("login");
+</script>
+</body>
+</html>

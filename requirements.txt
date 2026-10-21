@@ -1,0 +1,24 @@
+# Supply-chain multi-agent scheduling & exception handling system
+# Dev-validation prototype dependencies
+# Python 3.11+ / 3.13 verified; Windows 11
+# Install: cd supply-chain-agent && python -m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt
+
+langgraph>=0.2.60          # multi-agent state machine + PostgresSaver checkpoint
+langchain>=0.3
+langchain-openai>=0.2      # DashScope / tongyi-intent-detect-v3 (OpenAI-compatible)
+mcp>=1.4                   # FastMCP tool layer
+pydantic>=2.9
+pydantic-settings>=2.5
+sqlalchemy>=2.0
+psycopg[binary]>=3.2       # pgvector connection (optional; falls back to MemorySaver)
+fastapi>=0.115             # API layer (later phase)
+uvicorn>=0.30
+python-dotenv>=1.0
+
+langgraph-checkpoint-postgres>=3.0  # HITL checkpointer persists across processes/restarts (AsyncPostgresSaver)
+redis>=5.2,<6.0                    # 记忆热层 + WAL stream（Redis 7.2 验证）
+
+# ---- 三平台化（sca.platform）----
+pymysql>=1.1.1                     # MySQL 驱动（SQLAlchemy 同步方言 mysql+pymysql）
+cryptography>=42                   # MySQL 8 默认 caching_sha2_password 认证需要
+PyJWT>=2.9                         # 登录令牌（HS256）

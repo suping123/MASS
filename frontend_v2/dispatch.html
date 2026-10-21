@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>调度平台 · 供应链调度系统</title>
+<link rel="stylesheet" href="/app.css?v=20261018g">
+</head>
+<body>
+<div class="app">
+  <nav class="sidebar" id="nav"></nav>
+  <main class="content" id="content"><div class="empty">加载中…</div></main>
+</div>
+
+<div class="modal-mask" id="mask">
+  <div class="modal">
+    <h3 id="mTitle">操作</h3>
+    <div id="mBody"></div>
+    <div class="row">
+      <button id="mCancel">取消</button>
+      <button class="primary" id="mOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js?v=20261018g"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const user = Auth.require("dispatcher");
+mountTopbar("调度平台");
+const P = new Set(user.perms || []);
+const has = (p) => P.has(p);
+const content = $("content");
+
+/* ---------------- 通用弹窗 ---------------- */
+let onOk = null;
+function dialog(title, bodyHtml, okText, cb) {
+  $("mTitle").textContent = title;
+  $("mBody").innerHTML = bodyHtml;
+  $("mOk").textContent = okText || "确定";
+  // .wide 是单个弹窗自己加的（处置弹窗要塞对比表），复用同一个 #mask，
+  // 不清掉的话后一个普通弹窗会莫名其妙变宽。
+  const box = $("mask").querySelector(".modal");
+  if (box) box.classList.remove("wide");
+  $("mask").classList.add("show");
+  onOk = cb;
+}
+function closeDialog() { $("mask").classList.remove("show"); onOk = null; }
+$("mCancel").onclick = closeDialog;
+$("mOk").onclick = async () => {
+  if (!onOk) return;
+  const btn = $("mOk");
+  btn.disabled = true;
+  try { await onOk(); } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+};
+function askReason(title, tip, cb) {
+  dialog(title, '<div class="muted" style="margin-bottom:8px">' + esc(tip) + '</div>' +
+    '<textarea id="reasonInput" rows="3" placeholder="请填写原因（会记入系统日志）"></textarea>',
+    "提交", async () => {
+      const v = $("reasonInput").value.trim();
+      if (v.length < 2) { toast("请填写原因（至少 2 个字）"); return; }
+      await cb(v);
+      closeDialog();
+    });
+}
+
+/* ---------------- 导航 ---------------- */
+const PANELS = [
+  { id: "agent",   name: "智能调度",     perm: "dispatch:read_all",      render: renderAgent },
+  { id: "work",    name: "工作台",       perm: "dispatch:read_all",      render: renderWork },
+  { id: "bidding", name: "竞价",         perm: "dispatch:read_all",      render: renderBidding },
+  { id: "history", name: "历史调度",     perm: "dispatch:history",       render: renderHistory },
+  { id: "fee",     name: "服务费规则",   perm: "dispatch:fee_rule_view", render: renderFee },
+  { id: "config",  name: "模型与工具",   perm: "admin:model_config",     render: renderConfig },
+  { id: "kb",      name: "知识库",       perm: "dispatch:knowledge",     render: renderKb },
+  { id: "orgs",    name: "组织与用户",   perm: "dispatch:org_view",      render: renderOrgs },
+  { id: "logs",    name: "系统日志",     perm: "dispatch:audit_read",    render: renderLogs },
+];
+
+function buildNav() {
+  const visible = PANELS.filter(p => has(p.perm));
+  $("nav").innerHTML = '<div class="nav-group">调度</div>' +
+    visible.map((p, i) => '<div class="nav-item' + (i === 0 ? " active" : "") +
+      '" data-panel="' + p.id + '">' + esc(p.name) + '</div>').join("") +
+    '<div class="nav-foot">调度控制台</div>';
+  $("nav").querySelectorAll(".nav-item").forEach(el => {
+    el.onclick = () => {
+      // 竞价看板有轮询：换面板必须先停，否则后台每 15 秒重画一个已经不存在的表格
+      stopBidTimer();
+      $("nav").querySelectorAll(".nav-item").forEach(x => x.classList.remove("active"));
+      el.classList.add("active");
+      const p = PANELS.find(x => x.id === el.dataset.panel);
+      content.innerHTML = '<div class="empty">加载中…</div>';
+      p.render().catch(e => { content.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; });
+    };
+  });
+}
+
+
+/* ---------------- 智能调度 ---------------- */
+const AG_KEY = "sca_ag_sid";
+let agSid = localStorage.getItem(AG_KEY) || null;
+
+const AG_INTRO = "我是调度助手。可以直接吩咐我办事，也可以问我订单相关的问题：\n" +
+  "- 办事：「给 SO… 出方案」「把 SO… 挂牌」「处置异常」\n" +
+  "- 看情况：「看一下整体情况」「有什么待处置的异常」\n" +
+  "- 问知识：「冷链和生鲜有什么区别」「医药冷链要注意什么」「服务费怎么算」\n" +
+  "改状态的动作我都会先给方案，你确认后才执行。";
+
+const AG_QUICK = [
+  ["运行概览", "看一下整体情况"],
+  ["待处置异常", "有什么待处置的异常"],
+  ["货类区别", "冷链和生鲜有什么区别"],
+  ["费用构成", "服务费怎么算"],
+];
+
+function agChips(items) {
+  const box = $("agChips");
+  if (!box) return;
+  box.innerHTML = items.map((it, i) =>
+    '<button class="ag-chip" data-chip="' + i + '">' + esc(it[0]) + "</button>").join("");
+  box.querySelectorAll("button[data-chip]").forEach(b => {
+    b.onclick = () => agSend(items[Number(b.dataset.chip)][1]);
+  });
+}
+
+function agSide(card, trace, overview) {
+  const box = $("agSide");
+  if (!box) return;
+  const parts = [];
+
+  if (card) {
+    const flags = [];
+    if (card.temp_ctrl) flags.push("温控");
+    if (card.hazmat) flags.push("危险品");
+    parts.push('<div class="ag-sec"><h3>当前订单</h3>' +
+      '<div class="ag-route"><b>' + esc(card.origin || "-") + "</b>" +
+      '<span class="ag-arrow">→</span><b>' + esc(card.dest || "-") + "</b></div>" +
+      '<div class="ag-kvline"><span>订单号</span><b>' + esc(card.order_no) + "</b></div>" +
+      '<div class="ag-kvline"><span>状态</span><b>' + esc(card.status_label) + "</b></div>" +
+      '<div class="ag-kvline"><span>货物</span><b>' + esc(card.cargo_type) +
+      (card.weight_t != null ? " · " + card.weight_t + " 吨" : "") +
+      (flags.length ? " · " + flags.join(" / ") : "") + "</b></div>" +
+      '<div class="ag-kvline"><span>要求送达</span><b>' + esc(card.required_by || "-") + "</b></div>" +
+      (card.budget_max != null ? '<div class="ag-kvline"><span>预算上限</span><b>' +
+        money(card.budget_max) + "</b></div>" : "") +
+      (card.plan ? '<div class="ag-kvline"><span>方案</span><b>v' + card.plan.version +
+        " · " + Number(card.plan.distance_km).toFixed(0) + " km · " +
+        Number(card.plan.eta_h).toFixed(1) + " h</b></div>" : "") +
+      (card.publish ? '<div class="ag-total"><span>挂牌价</span><b>' +
+        money(card.publish.publish_price) + "</b></div>" : "") +
+      (card.open_exceptions ? '<div class="ag-kvline" style="margin-top:8px">' +
+        '<span>未闭环异常</span><b>' + esc(card.level || "") + " · " +
+        card.open_exceptions + " 条</b></div>" : "") +
+      "</div>");
+  }
+
+  if (trace && trace.length) {
+    parts.push('<div class="ag-sec"><h3>决策轨迹</h3><ol class="ag-trace">' +
+      trace.map(t => "<li>" + esc(t) + "</li>").join("") + "</ol></div>");
+  }
+
+  if (overview) {
+    const ord = overview.orders || {};
+    const keys = Object.keys(ord);
+    parts.push('<div class="ag-sec"><h3>运行概览</h3>' +
+      '<div class="ag-kvline"><span>订单总数</span><b>' +
+      keys.reduce((a, k) => a + ord[k], 0) + "</b></div>" +
+      '<div class="ag-kvline"><span>待处置异常</span><b>' + (overview.open_exceptions ?? 0) + "</b></div>" +
+      '<div class="ag-kvline"><span>异常自愈率</span><b>' + (overview.self_heal_rate ?? 0) + "%</b></div>" +
+      "</div>");
+  }
+
+  if (!parts.length) {
+    parts.push('<div class="ag-sec"><h3>当前订单</h3><div class="ag-empty">' +
+      "发一个订单号（SO 开头），或者问「这单怎么样」，这里会显示这单的路线、方案、挂牌价和异常。" +
+      "</div></div>");
+    parts.push('<div class="ag-sec"><h3>能做什么</h3><div class="ag-empty">' +
+      "出方案 → 定价挂牌 → 异常分级与处置，每一步都会先把结果说清楚，等你确认。" +
+      "</div></div>");
+  }
+  box.innerHTML = parts.join("");
+}
+
+async function renderAgent() {
+  content.innerHTML =
+    '<div class="agent-shell">' +
+      '<div class="card agent-main">' +
+        '<div class="panel-title"><h2>智能调度助手</h2><span class="spacer"></span>' +
+        '<button class="small" id="agNew">新会话</button></div>' +
+        '<div class="chat" id="agChat"></div>' +
+        '<div class="ag-chips" id="agChips"></div>' +
+        '<div class="chat-input"><input id="agText" placeholder="例如：给 SO2026… 出方案 / 处置异常 / 医药冷链要注意什么">' +
+        '<button class="primary" id="agSend">发送</button></div>' +
+      "</div>" +
+      '<div class="card agent-side" id="agSide"></div>' +
+    "</div>";
+
+  const chat = $("agChat");
+  agSide(null);
+  agChips(AG_QUICK);
+
+  if (agSid) {
+    try {
+      const rows = await api("/api/dispatch/chat/" + encodeURIComponent(agSid));
+      if (rows && rows.length) {
+        rows.forEach(m => pushMsg(chat, m.role === "user" ? "user" : "agent", m.content));
+        pushMsg(chat, "sys", "已恢复上次的对话，可以接着说。");
+        const last = rows.filter(m => m.role === "agent").pop();
+        if (last && last.meta && last.meta.trace) agSide(null, last.meta.trace, null);
+      }
+    } catch (e) {
+      agSid = null;
+      localStorage.removeItem(AG_KEY);
+    }
+  }
+  if (!chat.children.length) pushMsg(chat, "agent", AG_INTRO);
+
+  $("agSend").onclick = () => agSend();
+  $("agText").addEventListener("keydown", e => { if (e.key === "Enter") agSend(); });
+  $("agNew").onclick = () => {
+    agSid = null;
+    localStorage.removeItem(AG_KEY);
+    chat.innerHTML = "";
+    pushMsg(chat, "agent", AG_INTRO);
+    agSide(null);
+    agChips(AG_QUICK);
+  };
+  $("agText").focus();
+}
+
+async function agSend(prefill) {
+  const input = $("agText");
+  if (!input) return;
+  const t = String(prefill || input.value || "").trim();
+  if (!t) return;
+  const chat = $("agChat");
+  input.value = "";
+  pushMsg(chat, "user", t);
+
+  const typing = document.createElement("div");
+  typing.className = "msg agent";
+  typing.innerHTML = '<span class="ag-typing"><i></i><i></i><i></i></span>';
+  chat.appendChild(typing);
+  chat.scrollTop = chat.scrollHeight;
+
+  try {
+    const r = await api("/api/dispatch/chat", {
+      method: "POST", body: { session_id: agSid, text: t },
+    });
+    agSid = r.session_id;
+    localStorage.setItem(AG_KEY, agSid);
+    typing.remove();
+    pushMsg(chat, "agent", r.reply);
+    const d = r.data || {};
+    agSide(d.focus || null, r.trace || [], d.overview || null);
+    const acts = (r.actions || []).map(a => [a.label, a.text]);
+    agChips(acts.length ? acts : AG_QUICK);
+  } catch (e) {
+    typing.remove();
+    pushMsg(chat, "sys", "出错了：" + e.message);
+  }
+}
+
+/* ---------------- 工作台 ---------------- */
+async function renderWork() {
+  const [orders, excs, ags] = await Promise.all([
+    api("/api/dispatch/orders"), api("/api/dispatch/exceptions?status=open"),
+    // agent 状态拿不到不该让工作台整块空白：这是提示，不是主数据
+    api("/api/dispatch/agents/status").catch(() => null),
+  ]);
+  const rows = orders.filter(r => r.status !== "draft");
+  content.innerHTML =
+    (ags && ags.any_offline
+      ? '<div class="warnbox danger">有 Agent 没在跑：' + esc((ags.offline || []).join("、")) +
+        "。下面的「出方案 / 定价挂牌」会超时失败（不是单子的问题），" +
+        "先双击 start_agents.bat，再回来刷新。</div>"
+      : "") +
+    '<div class="card"><div class="panel-title"><h2>订单队列</h2><span class="spacer"></span>' +
+    '<button class="small" id="workRefresh">刷新</button></div>' +
+    (rows.length ? '<table><thead><tr><th>订单号</th><th>货主</th><th>线路</th><th>货类</th>' +
+      '<th>预算</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+      rows.map(r => {
+        const ops = ['<button class="small" data-act="detail" data-id="' + r.id + '">详情</button>'];
+        if (["submitted", "planned"].includes(r.status))
+          ops.push('<button class="small" data-act="plan" data-id="' + r.id + '">出方案</button>');
+        if (["planned", "published"].includes(r.status))
+          ops.push('<button class="small primary" data-act="publish" data-id="' + r.id + '">定价挂牌</button>');
+        if (has("order:cancel") && !["delivered", "settled", "cancelled"].includes(r.status))
+          ops.push('<button class="small danger" data-act="cancel" data-id="' + r.id +
+            '" data-no="' + esc(r.order_no) + '">取消</button>');
+        return '<tr><td>' + esc(r.order_no) + '</td><td>' + esc(r.shipper_org || "-") +
+          '</td><td>' + esc(r.origin) + '→' + esc(r.dest) + '</td>' +
+          '<td>' + esc(r.cargo_type) + ' ' + (r.weight_t ?? "-") + '吨</td>' +
+          '<td>' + money(r.budget_max) + '</td>' +
+          '<td>' + statusTag(r.status, r.status_label) + '</td>' +
+          '<td class="row-actions">' + ops.join("") + '</td></tr>';
+      }).join("") + '</tbody></table>' : '<div class="empty">暂无进行中的订单</div>') +
+    '</div>' +
+    '<div class="card"><div class="panel-title"><h2>待处置异常</h2><span class="spacer"></span>' +
+    '<button class="small" id="wxScan">扫描在途天气</button></div>' +
+    (excs.length ? '<table><thead><tr><th>订单</th><th>位置</th><th>情况</th><th>上报时间</th><th>操作</th></tr></thead><tbody>' +
+      excs.map(r => '<tr><td>' + esc(r.order_no) + '</td><td>' + esc(r.position_text) +
+        '</td><td>' + esc(r.description) + '</td><td class="muted">' + esc(r.reported_at) +
+        '</td><td class="row-actions"><button class="small" data-act="sop" data-eid="' + r.id +
+        '">建议方案</button><button class="small primary" data-act="resolve" data-eid="' + r.id +
+        '" data-oid="' + r.order_id + '">处置</button></td></tr>').join("") + '</tbody></table>'
+      : '<div class="empty">没有待处置的异常</div>') + '</div>';
+
+  const rf = $("workRefresh");
+  if (rf) rf.onclick = renderWork;
+  const wx = $("wxScan");
+  if (wx) wx.onclick = () => doWeatherScan(wx);
+  content.querySelectorAll("button[data-act]").forEach(b => {
+    const act = b.dataset.act, id = Number(b.dataset.id || b.dataset.eid);
+    b.onclick = () => {
+      if (act === "plan") doPlan(id, b);
+      else if (act === "publish") doPublish(id, b);
+      else if (act === "cancel") doCancelOrder(id, b.dataset.no);
+      else if (act === "sop") doSop(id);
+      else if (act === "resolve") doResolve(id, Number(b.dataset.oid));
+      else if (act === "detail") openOrderDetail(id);
+    };
+  });
+}
+
+/* ---------------- 竞价看板 ---------------- */
+// 轮询是为了"截止倒计时"和"刚有几家报了价"能自己动；换面板必须先停，
+// 否则后台每 15 秒重画一个已经不存在的表格。
+let bidTimer = null;
+let bidAll = false;
+function stopBidTimer() {
+  if (bidTimer) { clearTimeout(bidTimer); bidTimer = null; }
+}
+
+function agStripHtml(st) {
+  const items = (st && st.agents) || [];
+  if (!items.length) {
+    return '<span class="muted">没有 agent 注册记录——先双击 start_agents.bat，' +
+      '否则挂牌/接单会一直超时。</span>';
+  }
+  return items.map(a => {
+    const off = !a.online;
+    const age = a.age_s == null ? "" : Math.round(a.age_s) + "s 前";
+    return '<span class="ags-item' + (off ? " off" : "") + '">' +
+      '<span class="ags-dot"></span>' + esc(a.name) +
+      '<span class="ags-meta">' + (off ? (a.age_s == null ? "从未启动" : "离线 · " + age) : "在线") +
+      (a.pending ? " · 积压 " + a.pending : "") + "</span></span>";
+  }).join("");
+}
+
+async function renderBidding() {
+  content.innerHTML =
+    '<div class="card"><div class="panel-title"><h2>竞价看板</h2><span class="spacer"></span>' +
+      '<label class="muted" style="font-size:12px;display:flex;align-items:center;gap:5px">' +
+      '<input type="checkbox" id="bidAll"> 含已结束</label>' +
+      '<button class="small" id="bidRefresh">刷新</button></div>' +
+      '<div class="agstrip" id="agStrip"><span class="muted">读取 Agent 状态…</span></div>' +
+      '<div id="bidWarn"></div>' +
+      '<div id="bidBoard"><div class="empty">加载中…</div></div>' +
+    "</div>";
+  $("bidAll").checked = bidAll;
+  $("bidAll").onchange = () => { bidAll = $("bidAll").checked; loadBoard(); };
+  $("bidRefresh").onclick = () => loadBoard();
+  await loadBoard();
+}
+
+function boardTable(board) {
+  const items = (board && board.items) || [];
+  if (!items.length) {
+    return '<div class="empty">没有正在竞价的订单。定价挂牌后会自动开标，' +
+      '承运商报价就会出现在这里。</div>';
+  }
+  return '<table><thead><tr><th>订单号</th><th>线路</th><th>可付上限</th>' +
+    '<th>报价</th><th>价格区间</th><th>截止</th><th>状态</th><th></th></tr></thead><tbody>' +
+    items.map(it => {
+      const left = it.seconds_left;
+      const cls = left == null ? "" : (left < 0 ? " over" : (left < 600 ? " hot" : ""));
+      // "过了截止还在收标"是对人的提示，不是正常态：要么 agent 没在跑，
+      // 要么这一轮还没扫到。没有 dispatch:publish 的人不许看见这个按钮。
+      const overdue = it.status === "open" && left != null && left < 0 &&
+        has("dispatch:publish");
+      const range = it.min_quote == null
+        ? '<span class="muted">还没有报价</span>'
+        : money(it.min_quote) + (it.max_quote > it.min_quote
+            ? ' <span class="muted">– ' + money(it.max_quote) + "</span>" : "");
+      const extra = it.winner && it.winner.carrier_org
+        ? '<div class="muted" style="font-size:11.5px;margin-top:3px">' +
+          esc(it.winner.carrier_org) + " · " + money(it.winner.amount) + "</div>"
+        : (it.status === "negotiating" && it.target_org
+            ? '<div class="muted" style="font-size:11.5px;margin-top:3px">在跟 ' +
+              esc(it.target_org) + " 谈</div>" : "");
+      return '<tr><td><button class="link" data-bid="' + it.order_id + '">' +
+          esc(it.order_no) + "</button></td>" +
+        "<td>" + esc(it.origin) + "→" + esc(it.dest) + "</td>" +
+        "<td>" + money(it.budget) + "</td>" +
+        '<td class="cnt">' + (it.bid_count || 0) + " 家</td>" +
+        "<td>" + range + "</td>" +
+        '<td class="cnt' + cls + '">' + countdown(left) + "</td>" +
+        "<td>" + tenderTag(it.status, it.status_label) + extra + "</td>" +
+        // 过了截止还在"收标"的单，意味着 due() 还没轮到它（或 agent 没在跑）。
+        // 这种行必须自己长出裁决按钮：否则人看到"已过 12 分钟"，却找不到能点的地方。
+        '<td class="row-actions"><button class="small" data-bid="' + it.order_id +
+          '">比价</button>' +
+          (overdue ? '<button class="small" data-close="' + it.order_id +
+            '">裁决</button>' : "") + "</td></tr>";
+    }).join("") + "</tbody></table>";
+}
+
+async function loadBoard() {
+  stopBidTimer();
+  try {
+    const [st, board] = await Promise.all([
+      api("/api/dispatch/agents/status"),
+      api("/api/dispatch/tenders?status=" + (bidAll ? "all" : "active")),
+    ]);
+    const strip = $("agStrip");
+    if (strip) strip.innerHTML = agStripHtml(st);
+    const warn = $("bidWarn");
+    if (warn) {
+      warn.innerHTML = (st && st.any_offline)
+        ? '<div class="warnbox danger">有 Agent 没在跑：' +
+          esc((st.offline || []).join("、")) + "。挂牌、接单这类写入会超时失败" +
+          "（这不是单子的问题），先双击 start_agents.bat。</div>"
+        : "";
+    }
+    const box = $("bidBoard");
+    if (box) {
+      box.innerHTML = boardTable(board);
+      box.querySelectorAll("button[data-bid]").forEach(b => {
+        b.onclick = () => openBidding(Number(b.dataset.bid));
+      });
+      box.querySelectorAll("button[data-close]").forEach(b => {
+        b.onclick = () => openBidding(Number(b.dataset.close), true);
+      });
+    }
+  } catch (e) {
+    const box = $("bidBoard");
+    if (box) box.innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+  }
+  if ($("bidBoard")) bidTimer = setTimeout(loadBoard, 15000);
+}
+
+// 手动截止并裁决。自动路径是 dispatch agent 的 due() 每 15s 扫一次，
+// 这里补的是"我不想等"和"它没扫到"两种情形。
+//
+// 确认放在抽屉底部原地展开，**不弹 dialog**：`.drawer-mask` 是 z-index 60，
+// `.modal-mask` 是 50，弹出来会被抽屉盖住——人只会看到按钮点了没反应。
+function closeFootHtml(t, confirming) {
+  const over = t.deadline_at ? new Date(t.deadline_at).getTime() <= Date.now() : false;
+  const n = t.bid_count == null ? "现有" : t.bid_count + " 家";
+  if (!confirming) {
+    const leftS = t.deadline_at
+      ? Math.round((new Date(t.deadline_at).getTime() - Date.now()) / 1000) : null;
+    return '<span class="muted" style="margin-right:auto">' +
+      (leftS != null && leftS <= 0 ? "已过收标截止，等待裁决"
+        : (leftS != null ? "还在收标：" + countdown(leftS) : "还在收标")) +
+      "</span>" +
+      '<button class="small" id="closeTenderBtn">' +
+      (over ? "截止并裁决" : "提前截止并裁决") + "</button>";
+  }
+  return '<span class="muted" style="margin-right:auto">' +
+    (over ? "现在裁决，按已收到的 " : "提前截止后不再接受新报价，按现有 ") + n +
+    "份报价定标。超预算但差距可谈会立刻发起还价；一份报价都没有则判流标。" +
+    "</span>" +
+    '<button class="small ghost" id="closeCancel">取消</button>' +
+    '<button class="small" id="closeOk">确认裁决</button>';
+}
+
+function bindCloseFoot(id, t) {
+  const foot = document.querySelector(".drawer-foot");
+  if (!foot) return;
+  if ($("closeTenderBtn")) {
+    $("closeTenderBtn").onclick = () => {
+      foot.innerHTML = closeFootHtml(t, true);
+      bindCloseFoot(id, t);
+    };
+  }
+  if ($("closeCancel")) {
+    $("closeCancel").onclick = () => {
+      foot.innerHTML = closeFootHtml(t, false);
+      bindCloseFoot(id, t);
+    };
+  }
+  if ($("closeOk")) $("closeOk").onclick = () => closeTenderNow(id);
+}
+
+async function closeTenderNow(id) {
+  const btn = $("closeOk");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/api/dispatch/orders/" + id + "/tender/close?force=true",
+      { method: "POST" });
+    toast("已裁决：" + ((r && r.status_label) || "完成"));
+    closeDrawer();
+    await loadBoard();
+    openBidding(id);      // 直接回到结论页：裁决完最该看的是"为什么是这家"
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    toast(e.message);
+  }
+}
+
+// 单票完整视图：结论 -> 比价表 -> 还价轨迹 -> agent 之间的消息。
+// 顺序就是人要问的顺序："定了没？为什么是它？谈过没有？谁参与谈的？"
+async function openBidding(id, askClose) {
+  try {
+    const t = await api("/api/dispatch/orders/" + id + "/tender");
+    if (!t.ok) { toast(t.reason || "这单没有招标记录"); return; }
+    const d = await api("/api/dispatch/orders/" + id);
+    let thread = null;
+    try { thread = await api("/api/dispatch/agents/thread?order_id=" + id); }
+    catch (e) { thread = null; }
+
+    const arb = t.arbitration || {};
+    const neg = t.negotiation || {};
+    const win = (t.bids || []).find(b => b.verdict === "winner");
+
+    let verdict;
+    // 协商成交的单，arb.reason 还是收标那一刻的结论（"可还价"），
+    // 直接拿来当结论会自相矛盾：页面说"可还价"，订单其实已经定了。
+    const viaNeg = !!(arb.outcome && arb.outcome.type === "negotiated");
+    if (t.status === "awarded") {
+      verdict = "由 <b>" + esc((win || {}).carrier_org || "（中标记录缺失）") + "</b> 承运" +
+        (viaNeg
+          ? "。协商第 " + (arb.outcome.round || 1) + " 轮以 <b>" +
+            money(arb.outcome.final_amount) + "</b> 成交（收标时最低报价超出可付上限，调度据此发起还价）。"
+          : (arb.reason ? "。" + esc(arb.reason) : "。"));
+    } else if (t.status === "negotiating") {
+      verdict = "最低报价超过了本单可付上限，但差距在可谈范围内，调度正在和 " +
+        esc((t.bids || []).find(b => b.carrier_org_id === neg.target_org_id)?.carrier_org || "该承运商") +
+        " 还价。目前已走 " + (neg.rounds_used || 0) + " / " + (neg.max_rounds || "-") + " 轮。";
+    } else if (t.status === "failed") {
+      verdict = "本单流标：" + esc(arb.reason || neg.reason || "没有可用的报价") + "。";
+    } else {
+      // 截止时间在服务端是字符串，倒计时在这里按本地时钟算，只用于展示
+      const left = t.deadline_at
+        ? Math.round((new Date(t.deadline_at).getTime() - Date.now()) / 1000) : null;
+      verdict = "还在收标，" + countdown(left) + "。";
+    }
+
+    const body =
+      '<div class="detail-hero"><div class="dh-main">' +
+        '<div class="dh-no">' + esc(d.order_no) + "</div>" +
+        '<div class="dh-sub">' + esc(d.origin) + " → " + esc(d.dest) +
+          "　·　" + esc(d.shipper_org || "-") + "</div>" +
+      "</div>" + tenderTag(t.status, t.status_label) + "</div>" +
+
+      detailSection("竞价结论",
+        '<div class="muted" style="line-height:1.7">' + verdict + "</div>" +
+        kvGrid([
+          ["本单可付上限（运费）", money(t.budget)],
+          ...(t.final_amount != null ? [["实际成交价", "<b>" + money(t.final_amount) + "</b>"]] : []),
+          ["报价家数", (t.bid_count || 0) + " 家"],
+          ["收标截止", esc(t.deadline_at || "-")],
+          ["裁决规则", esc(t.rule_version || "-")],
+        ])) +
+
+      detailSection("打分权重（改过权重会换中标家）",
+        (arb.weights ? weightBar(arb.weights) : '<div class="muted">还没裁决，暂无打分</div>')) +
+
+      detailSection("比价表", bidTable(t.bids, {
+        caption: arb.decided_at ? "裁决时间 " + arb.decided_at : "尚未裁决，以下为已收到的报价",
+      })) +
+
+      detailSection("还价轨迹",
+        (neg.turns && neg.turns.length)
+          ? negTimeline(neg) +
+            (neg.reason ? '<div class="muted" style="margin-top:8px">' + esc(neg.reason) + "</div>" : "")
+          : '<div class="muted">这单没有进入协商（裁决已直接定标或流标）。</div>') +
+
+      (thread && thread.count
+        ? detailSection("Agent 协作记录（" + thread.count + " 条）", agentThread(thread.messages))
+        : "");
+
+    // 只有"还在收标"且有权挂牌的人，才需要这个按钮。
+    // 已裁决/已流标的单再给一个"裁决"按钮，等于让人重复按一个幂等接口。
+    const canClose = t.status === "open" && has("dispatch:publish");
+    openDrawer("竞价 · " + d.order_no, body,
+               canClose ? closeFootHtml(t, false) : "");
+    if (canClose) {
+      bindCloseFoot(id, t);
+      // 从看板那行的「裁决」进来时，直接把确认展开——那一行点进来的人
+      // 目的就是裁决，不该再让他找一次按钮。
+      if (askClose) $("closeTenderBtn").click();
+    }
+  } catch (e) { toast(e.message); }
+}
+
+/* ---------------- 订单详情 ---------------- */
+const AGENT_NAME = { dispatch: "调度", exception: "异常域",
+                     shipper: "货主", carrier: "承运商" };
+
+function agentName(key) {
+  const parts = String(key || "").split(":");
+  return (AGENT_NAME[parts[0]] || parts[0]) + (parts[1] ? " #" + parts[1] : "");
+}
+
+// Agent 之间的消息回放。这是"多 agent 在协作"最直接的证据：
+// 看得到谁向谁提了什么、谁接受了、谁把它升级给了人。
+function agentThread(msgs) {
+  if (!msgs || !msgs.length) return '<div class="empty">暂无 Agent 之间的消息</div>';
+  return '<div class="amsg-list">' + msgs.map(m => {
+    const p = m.payload || {};
+    let body = p.reason || p.event || "";
+    if (!body && p.fields) body = "取字段：" + Object.keys(p.fields).join("、");
+    if (!body && p.note) body = p.note;
+    return '<div class="amsg' + (m.status === "failed" ? " failed" : "") + '">' +
+      '<div class="am-head">' + esc(agentName(m["from"])) +
+        '<span class="am-arrow">→</span>' + esc(agentName(m.to)) +
+        '<span class="tag">' + esc(m.type_label || m.type) + '</span>' +
+        (m.error ? '<span class="tag danger">失败</span>' : "") + '</div>' +
+      (body ? '<div class="am-body">' + esc(body) + '</div>' : "") +
+      (m.created_at ? '<div class="am-time">' + esc(m.created_at) + '</div>' : "") +
+      '</div>';
+  }).join("") + '</div>';
+}
+
+function routeChain(waypoints, origin, dest) {
+  const wp = waypoints || [];
+  if (!wp.length) {
+    return '<div class="route-chain"><span class="rc-node end">' + esc(origin) +
+      '</span><span class="rc-sep">→</span><span class="rc-node end">' + esc(dest) + '</span></div>';
+  }
+  return '<div class="route-chain">' + wp.map((n, i) => {
+    const end = i === 0 || i === wp.length - 1;
+    return '<span class="rc-node' + (end ? " end" : "") + '">' + esc(n) + '</span>' +
+      (i < wp.length - 1 ? '<span class="rc-sep">→</span>' : "");
+  }).join("") + '</div>';
+}
+
+async function openOrderDetail(id) {
+  try {
+    const d = await api("/api/dispatch/orders/" + id);
+    // Agent 协作记录是独立接口：拿不到（表没建/没消息）不该让整个详情失败
+    let thread = null;
+    try { thread = await api("/api/dispatch/agents/thread?order_id=" + id); }
+    catch (e) { thread = null; }
+    const plan = d.plan || {};
+    const pub = d.publish || {};
+    const wp = (d.plan && d.plan.waypoints) || [];
+
+    const moneyItems = [];
+    if (d.budget_max != null) moneyItems.push({ label: "货主预算", value: money(d.budget_max) });
+    if (pub.shipper_fee != null)
+      moneyItems.push({ label: "货主侧服务费", value: "−" + money(pub.shipper_fee) });
+    if (pub.publish_price != null)
+      moneyItems.push({ label: "承运商看到的价", value: money(pub.publish_price), strong: true });
+
+    const bidRows = (d.bids || []).map(b =>
+      kvGrid([["承运商", esc(b.carrier_org || "-")],
+              ["状态", esc({ candidate: "候选", accepted: "已接单", withdrawn: "已退出" }[b.decision] || b.decision)],
+              ["测算收益", money(b.profit)]])).join('<div style="height:10px"></div>');
+
+    // 有招标就有比价表；没有（v6 之前挂的老单）才退回旧的"承运商响应"。
+    // 两者不能都显示：同一批报价在抽屉里出现两遍，人会以为是两组数据。
+    const tender = d.tender || null;
+    const tenderNeg = (tender && tender.negotiation) || {};
+    const tenderBlock = (tender && (tender.bids || []).length)
+      ? detailSection("竞价（" + (tender.bid_count || 0) + " 家报价 · " +
+          esc(tender.status_label || tender.status) + "）",
+          bidTable(tender.bids, {
+            caption: [
+              tender.deadline_at ? "收标截止 " + tender.deadline_at : "",
+              (tender.arbitration || {}).reason || "",
+            ].filter(Boolean).join("　·　"),
+          }) +
+          (((tenderNeg.turns || []).length)
+            ? '<div style="margin-top:14px"><div class="muted" style="margin-bottom:6px">' +
+              "还价轨迹</div>" + negTimeline(tenderNeg) + "</div>"
+            : ""))
+      : "";
+
+    const body =
+      '<div class="detail-hero"><div class="dh-main">' +
+        '<div class="dh-no">' + esc(d.order_no) + '</div>' +
+        '<div class="dh-sub">' + esc(d.origin) + " → " + esc(d.dest) +
+          '　·　' + esc(d.shipper_org || "-") + '</div>' +
+      '</div>' + statusTag(d.status, d.status_label) + '</div>' +
+
+      detailSection("金额链路",
+        moneyItems.length ? amountList(moneyItems) : '<div class="muted">尚未定价挂牌</div>') +
+
+      detailSection("调度方案",
+        plan.distance_km
+          ? routeChain(plan.waypoints, d.origin, d.dest) +
+            '<div class="muted" style="margin-top:8px">第 ' + (plan.version ?? 1) + ' 版 · 全程 ' +
+            plan.distance_km + ' km · 预计 ' + (plan.eta_h ?? "-") + ' 小时 · 来源 ' +
+            esc(plan.provider || "-") + '</div>' +
+            // 天气只上浮 ETA，不改价格。基准值一起给出，否则看的人会以为
+            // 里程算错了或者绕远了——其实是天气把时间抬上去了。
+            (Number(plan.weather_factor) > 0
+              ? '<div class="warnbox">天气上浮：' +
+                esc(((plan.weather || {}).condition) || "沿途恶劣天气") +
+                '，预计时效 ' + Number(plan.eta_base_h || 0).toFixed(1) + ' → ' +
+                Number(plan.eta_h || 0).toFixed(1) + ' 小时（+' +
+                Math.round(Number(plan.weather_factor) * 100) + '%）。' +
+                esc((plan.weather || {}).note || "") + '</div>'
+              : "") +
+            (plan.avoid_city
+              ? '<div class="warnbox ok">改道版本：已' +
+                (plan.avoid_verified ? "校验绕开" : "尝试绕开") + '「' +
+                esc(plan.avoid_city) + '」' +
+                (plan.real_note ? ' · ' + esc(plan.real_note) : "") + '</div>'
+              : "")
+          : '<div class="muted">还没有生成方案</div>') +
+
+      detailSection("货物", kvGrid([
+        ["货类", esc(d.cargo_type)],
+        ["重量", (d.weight_t ?? "-") + " 吨"],
+        ["温控", d.temp_ctrl ? "需要" : "不需要"],
+        ["危险品", d.hazmat ? "是" : "否"],
+        ["要求送达", esc(d.required_by || "-")],
+      ])) +
+
+      detailSection("联系", kvGrid([
+        ["联系人", esc(d.contact_name || "-")],
+        ["电话", esc(d.contact_phone || "-")],
+        ["下单时间", esc(d.created_at || "-")],
+      ])) +
+
+      (tenderBlock || (bidRows ? detailSection("承运商响应", bidRows) : "")) +
+
+      (thread && thread.count
+        ? detailSection("Agent 协作记录（" + thread.count + " 条）",
+                        agentThread(thread.messages))
+        : "") +
+
+      detailSection("流转记录", eventTimeline(d.events));
+
+    openDrawer("订单详情", body);
+  } catch (e) { toast(e.message); }
+}
+
+async function doPlan(id, btn) {
+  btn.disabled = true;
+  try {
+    const r = await api("/api/dispatch/orders/" + id + "/plan", { method: "POST" });
+    toast("方案已生成：" + r.plan.distance_km + " km / " + r.plan.eta_h + " h");
+    renderWork();
+  } catch (e) { toast(e.message); btn.disabled = false; }
+}
+async function doPublish(id, btn) {
+  btn.disabled = true;
+  try {
+    const r = await api("/api/dispatch/orders/" + id + "/publish", { method: "POST", body: {} });
+    toast("已挂牌：承运商看到 " + money(r.publish_price) + (r.warning ? "；" + r.warning : ""));
+    renderWork();
+  } catch (e) { toast(e.message); btn.disabled = false; }
+}
+function doCancelOrder(id, no) {
+  askReason("取消订单 " + no, "取消后订单进入终态，承运商会被释放。", async (reason) => {
+    await api("/api/dispatch/orders/" + id + "/cancel", { method: "POST", body: { reason } });
+    toast("已取消");
+    renderWork();
+  });
+}
+async function doSop(eid) {
+  try {
+    const r = await api("/api/dispatch/exceptions/" + eid + "/sop");
+    const hits = r.hits || [];
+    const tri = r.triage || {};
+    dialog("处置建议（知识库）",
+      (tri.level ? '<div class="kv" style="margin-bottom:10px">' +
+        '<div class="k">分级</div><div><b>' + esc(tri.level) + "</b> · " +
+          esc(tri.name || "") + (tri.approval ? "（需人工审批）" : "") + "</div>" +
+        '<div class="k">影响</div><div>' + esc(tri.impact || "-") + "</div>" +
+        '<div class="k">时限</div><div>' + esc(tri.sla_min ?? "-") + " 分钟内处置</div>" +
+        "</div>" : "") +
+      '<div class="muted" style="margin-bottom:8px">检索渠道：' + esc(r.channel || "-") +
+      '　查询：' + esc(r.query) + '</div>' +
+      (hits.length ? hits.map(h => '<div style="margin-bottom:12px"><b>' + esc(h.sop_id) +
+        '　' + esc(h.title) + '</b> <span class="tag">' + esc(h.level || "") + '</span>' +
+        ' <span class="muted">match ' + (h.match ?? "-") + '</span><ol style="margin:6px 0 0 18px;padding:0">' +
+        (h.steps || []).map(s => '<li>' + esc(s) + '</li>').join("") + '</ol></div>').join("")
+        : '<div class="empty">未检索到匹配的处置方案</div>'),
+      "关闭", async () => { closeDialog(); });
+  } catch (e) { toast(e.message); }
+}
+/* ---------------- 异常处置（五种动作） ----------------
+   改造前只有三个选项，而且「调整路线后继续」和「继续运输」落库结果完全一样：
+   都只是回到 in_transit，路线一个点都没动——文案说改道了，实际没改。
+   现在三个动作各有真实实现，且改道/改期都是**先预览再提交**：
+     replan   → /reroute-preview 算出对比表，确认后 resolve 落新方案版本
+     extend   → 独立改期，写 before/after，并通知货主与承运商
+     reassign → 按 5 个触发码判定，不成立的直接灰掉（判定只在服务端一处）
+   ------------------------------------------------------ */
+const RESOLVE_ACTIONS = [
+  { code: "resume", label: "继续运输" },
+  { code: "replan", label: "改道绕行" },
+  { code: "extend", label: "延长时效" },
+  { code: "deliver", label: "标记已送达" },
+  { code: "reassign", label: "改派承运商", perm: "dispatch:reassign" },
+];
+
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
+function hhmm(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.getMonth() + 1 + "-" + pad2(d.getDate()) + " " +
+    pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+// 变化量：正数红、负数绿（里程/成本/时效都是"变大更糟"）
+function deltaCell(v, unit, digits) {
+  const n = Number(v || 0);
+  const dd = digits == null ? 1 : digits;
+  const cls = n > 0 ? "up" : (n < 0 ? "down" : "");
+  return '<span class="' + cls + '">' + (n > 0 ? "+" : "") + n.toFixed(dd) + (unit || "") + "</span>";
+}
+
+async function doResolve(eid, orderId) {
+  const ACTS = RESOLVE_ACTIONS.filter(a => !a.perm || has(a.perm));
+  const st = { act: "resume", preview: null, pvErr: "", pvBusy: false,
+               ops: null, opsErr: "", trg: null, newOrg: 0, delay: 4, text: "" };
+
+  let order = null;
+  try { order = await api("/api/dispatch/orders/" + orderId); } catch (e) { order = null; }
+
+  /* ---- 动作专属区块 ---- */
+  function extraHtml() {
+    if (st.act === "resume") {
+      return '<div class="muted">订单回到「在途」，路线、里程、承诺时效都不变。' +
+        '异常还没真正排除（比如故障没修好）时不要选这一项。</div>';
+    }
+    if (st.act === "deliver") {
+      return '<div class="warnbox">提交后订单直接转为「已送达」，不再走运输流程。' +
+        '确认货已在收货方手上再选。</div>';
+    }
+
+    if (st.act === "replan") {
+      if (st.pvBusy) {
+        return '<div class="muted">正在按真实路况重算路线（要把改道前后的里程都算一遍）…</div>';
+      }
+      if (st.pvErr) {
+        return '<div class="warnbox danger">' + esc(st.pvErr) + '</div>' +
+          '<div style="margin-top:8px"><button type="button" class="small" id="pvRetry">重新预览</button></div>';
+      }
+      if (!st.preview) {
+        return '<div class="muted">还没算改道方案。</div>' +
+          '<div style="margin-top:8px"><button type="button" class="small" id="pvRetry">开始预览</button></div>';
+      }
+      const pv = st.preview;
+      const o = pv.old, n = pv.new;
+      const cmp =
+        '<table class="cmp"><thead><tr><th>项目</th><th>原路线</th><th>改道后</th><th>变化</th></tr></thead><tbody>' +
+        '<tr><td>途经点</td><td>' + (o.waypoints || []).length + ' 个</td><td>' +
+          (n.waypoints || []).length + ' 个</td><td class="muted">—</td></tr>' +
+        '<tr><td>里程</td><td><b>' + Number(o.distance_km).toFixed(0) + ' km</b></td><td><b>' +
+          Number(n.distance_km).toFixed(0) + ' km</b></td><td>' +
+          deltaCell(pv.detour_km, " km", 1) + '</td></tr>' +
+        '<tr><td>预计时效</td><td>' + Number(o.eta_h).toFixed(1) + ' h</td><td>' +
+          Number(n.eta_h).toFixed(1) + ' h</td><td>' + deltaCell(pv.eta_delta_h, " h", 1) + '</td></tr>' +
+        '<tr><td>运输成本</td><td>' + money(o.cost_est) + '</td><td>' + money(n.cost_est) +
+          '</td><td>' + deltaCell(pv.cost_delta, " 元", 2) + '</td></tr>' +
+        '</tbody></table>';
+
+      return '<div class="muted" style="margin-bottom:6px">受影响城市 <b>' + esc(pv.avoid_city) +
+        '</b>（定位来源：' + esc(pv.source || "-") + '），已剔除途经点：' +
+        esc((pv.removed || []).join("、") || "-") + '，避让半径 ' + (pv.radius_km ?? "-") + ' km</div>' +
+        '<div class="muted" style="margin-bottom:4px">改道后路线</div>' +
+        routeChain(n.waypoints, order && order.origin, order && order.dest) +
+        cmp +
+        '<div class="warnbox ' + (pv.avoid_verified ? "ok" : "") + '">' + esc(pv.real_note) +
+          (pv.avoid_verified ? '；已用真实路径采样点校验，不再经过' + pv.avoid_city
+                             : '；未能验证是否绕开' + pv.avoid_city) + '</div>' +
+        (pv.warn ? '<div class="warnbox">' + esc(pv.warn) + '</div>' : "") +
+        '<div style="margin-top:8px"><button type="button" class="small" id="pvRetry">重算一次</button></div>';
+    }
+
+    if (st.act === "extend") {
+      const at = order && order.required_by_at;
+      const cur = (order && order.required_by) || "-";
+      const d = Number(st.delay) || 0;
+      let pre;
+      if (at) {
+        const base = new Date(at);
+        const after = new Date(base.getTime() + d * 3600000);
+        pre = '<div class="kv" style="margin-top:10px">' +
+          '<div class="k">原承诺</div><div>' + esc(cur) + '　<span class="muted">' +
+            esc(hhmm(at)) + '</span></div>' +
+          '<div class="k">新承诺</div><div><b>' + esc(hhmm(after.toISOString())) +
+            '</b>　<span class="muted">延后 ' + d + ' 小时</span></div></div>';
+      } else {
+        pre = '<div class="warnbox">这笔单只有货主原话「' + esc(cur) +
+          '」，没有可识别的绝对时间。提交时服务端会再解析一次，解析不出来会拒绝改期——' +
+          '这种情况请先补录准确的要求送达时间。</div>';
+      }
+      return '<label>延长时长（小时，0.5–72）</label>' +
+        '<input id="resDelay" type="number" step="0.5" min="0.5" max="72" value="' + d + '">' +
+        pre +
+        '<div class="muted" style="margin-top:8px">改期只延后不提前（提前属于改单），' +
+        '会写一条改期事件并给货主和承运商各发一条站内通知。</div>';
+    }
+
+    if (st.act === "reassign") {
+      if (st.opsErr) return '<div class="warnbox danger">' + esc(st.opsErr) + '</div>';
+      if (!st.ops) return '<div class="muted">正在读取改派条件…</div>';
+      const trg = (st.ops.triggers || []).map(t =>
+        '<div class="trg-item' + (t.code === st.trg ? " on" : "") + (t.eligible ? "" : " off") +
+          '" data-trg="' + esc(t.code) + '"><b>' + esc(t.label) + '</b>' +
+          '<span class="why">' + esc(t.eligible ? (t.why || t.detail)
+            : ("不成立：" + (t.why || "条件未满足"))) + '</span></div>').join("");
+      const cars = (st.ops.carriers || []).filter(c => c.org_id !== st.ops.carrier_org_id);
+      return '<label>改派触发条件（不成立的不可选）</label>' +
+        '<div class="trg">' + trg + '</div>' +
+        '<label>指定新承运商（可选；不选则退回挂牌池重新找人）</label>' +
+        '<select id="resNewCar"><option value="0">不指定 —— 退回挂牌池重新挂牌</option>' +
+        cars.map(c => '<option value="' + c.org_id + '"' + (c.org_id === st.newOrg ? " selected" : "") +
+          '>' + esc(c.name) + '　' + money(c.cost_per_km) + '/km　' +
+          (c.capacity_t || 0) + ' 吨</option>').join("") + '</select>' +
+        '<div class="warnbox">改派会释放原承运商、关闭在挂挂牌单，并通知原承运商/货主/新承运商。' +
+        '结算金额本轮不动，费用归属记为「待人工确认」。</div>';
+    }
+    return "";
+  }
+
+  /* ---- 重绘 ---- */
+  function paint() {
+    const modal = $("mask").querySelector(".modal");
+    if (modal) modal.classList.add("wide");
+    $("mBody").innerHTML =
+      '<label class="first-label">处置结论（会给承运商和货主看）</label>' +
+      '<textarea id="resText" rows="3" placeholder="例如：就近维修后继续运输，预计延误 2 小时">' +
+        esc(st.text) + '</textarea>' +
+      '<label>后续动作</label>' +
+      '<div class="opts" id="resOpts">' + ACTS.map(a =>
+        '<button type="button" class="opt' + (a.code === st.act ? " on" : "") +
+        '" data-act="' + a.code + '">' + esc(a.label) + '</button>').join("") + '</div>' +
+      '<div id="resExtra">' + extraHtml() + '</div>';
+    bind();
+  }
+
+  async function loadPreview() {
+    st.pvBusy = true; st.pvErr = ""; st.preview = null;
+    paint();
+    try {
+      const r = await api("/api/dispatch/exceptions/" + eid + "/reroute-preview",
+        { method: "POST", body: {} });
+      if (r && r.ok === false) { st.pvErr = r.reason || "无法生成改道方案"; }
+      else { st.preview = r; }
+    } catch (e) { st.pvErr = e.message; }
+    st.pvBusy = false;
+    paint();
+  }
+
+  async function loadOptions() {
+    try { st.ops = await api("/api/dispatch/reassign/options?order_id=" + orderId); }
+    catch (e) { st.ops = null; st.opsErr = e.message; }
+    paint();
+  }
+
+  function bind() {
+    $("mBody").querySelectorAll("button[data-act]").forEach(b => {
+      b.onclick = () => {
+        const ta = $("resText");
+        if (ta) st.text = ta.value;
+        st.act = b.dataset.act;
+        paint();
+        if (st.act === "replan" && !st.preview && !st.pvBusy && !st.pvErr) loadPreview();
+        if (st.act === "reassign" && !st.ops && !st.opsErr) loadOptions();
+      };
+    });
+    const rt = $("pvRetry");
+    if (rt) rt.onclick = () => loadPreview();
+
+    const dl = $("resDelay");
+    if (dl) {
+      dl.onchange = () => {
+        st.delay = Number(dl.value) || 0;
+        const ta = $("resText");
+        if (ta) st.text = ta.value;
+        paint();
+      };
+    }
+    $("mBody").querySelectorAll(".trg-item").forEach(el => {
+      el.onclick = () => {
+        if (el.classList.contains("off")) { toast("该触发条件对这笔单不成立"); return; }
+        st.trg = el.dataset.trg;
+        const ta = $("resText");
+        if (ta) st.text = ta.value;
+        const sel = $("resNewCar");
+        if (sel) st.newOrg = Number(sel.value) || 0;
+        paint();
+      };
+    });
+    const sel = $("resNewCar");
+    if (sel) sel.onchange = () => { st.newOrg = Number(sel.value) || 0; };
+  }
+
+  /* ---- 提交 ---- */
+  const submit = async () => {
+    const ta = $("resText");
+    const resolution = ((ta && ta.value) || "").trim();
+    if (resolution.length < 2) { toast("请填写处置结论（至少 2 个字）"); return; }
+
+    const body = { resolution, action: st.act };
+
+    if (st.act === "replan" && !st.preview) {
+      toast(st.pvErr ? ("改道方案不可用：" + st.pvErr) : "请先预览改道方案再提交");
+      return;
+    }
+    if (st.act === "extend") {
+      const v = Number(($("resDelay") || {}).value);
+      if (!(v >= 0.5 && v <= 72)) { toast("延长时长需在 0.5–72 小时之间"); return; }
+      body.delay_h = v;
+    }
+    if (st.act === "reassign") {
+      if (!st.trg) { toast("请选择改派触发条件"); return; }
+      if (resolution.length < 10) { toast("改派原因至少 10 个字（要写进审计日志）"); return; }
+      body.reason_code = st.trg;
+      const selEl = $("resNewCar");
+      const org = Number((selEl && selEl.value) || st.newOrg || 0);
+      if (org) body.new_carrier_org_id = org;
+    }
+
+    const r = await api("/api/dispatch/exceptions/" + eid + "/resolve",
+      { method: "POST", body });
+
+    // 改道可能被服务端降级为 replan_skipped（定位不到受影响路段）——
+    // 这时绝不能提示"已改道"，否则又回到"文案跑在实现前面"的老问题。
+    let msg;
+    if (r.action === "replan_skipped") msg = r.note || "未改道：无法定位受影响路段";
+    else if (r.action === "replan") msg = r.note || "已改道，新方案已生效";
+    else if (r.action === "extend") msg = r.note || "已改期";
+    else if (r.action === "reassign") msg = r.note || "已改派";
+    else msg = r.note || "已处置";
+    toast(msg, 3600);
+    closeDialog();
+    renderWork();
+  };
+
+  dialog("处置异常", "", "提交处置", submit);
+  paint();
+}
+
+/* ---------------- 在途天气扫描 ----------------
+   默认只预览（dry_run=true）：批量建异常单这种事，让调度先看清单再决定。
+   直接落库等于让外部天气服务决定系统里多出多少待办。
+   -------------------------------------------------- */
+async function doWeatherScan(btn) {
+  btn.disabled = true;
+  try {
+    const r = await api("/api/dispatch/weather/scan?dry_run=true");
+    const hits = r.created || [];
+    const body =
+      '<div class="muted" style="margin-bottom:8px">' + esc(r.note || "") + '</div>' +
+      (hits.length
+        ? '<table><thead><tr><th>订单</th><th>等级</th><th>天气异常</th></tr></thead><tbody>' +
+          hits.map(h => '<tr><td>' + esc(h.order_no || "-") + '</td><td>' +
+            statusTag((h.level || "P2").toLowerCase() === "p0" ? "exception" : "planned",
+                      h.level || "-") + '</td><td>' + esc(h.description || "-") +
+            '</td></tr>').join("") + '</tbody></table>'
+        : '<div class="empty">没有命中恶劣天气的在途订单</div>') +
+      (hits.length ? '<div class="warnbox">这里只是预览，点下方按钮才会真的建异常单。' +
+        '已经在待处置里的天气异常不会重复建。</div>' : "");
+
+    dialog("在途天气扫描（预览）", body, hits.length ? "生成异常单" : "关闭",
+      async () => {
+        if (!hits.length) { closeDialog(); return; }
+        const r2 = await api("/api/dispatch/weather/scan?dry_run=false", { method: "POST" });
+        toast(r2.note || ("已新建 " + (r2.created || []).length + " 条天气异常"), 3400);
+        closeDialog();
+        renderWork();
+      });
+    btn.disabled = false;
+  } catch (e) { toast(e.message); btn.disabled = false; }
+}
+
+/* ---------------- 历史调度 ---------------- */
+async function renderHistory() {
+  const kw = (window.__hkw || "").trim();
+  const rows = await api("/api/dispatch/history" + (kw ? "?keyword=" + encodeURIComponent(kw) : ""));
+  content.innerHTML =
+    '<div class="card"><div class="panel-title"><h2>历史调度</h2><span class="spacer"></span>' +
+    '<div class="toolbar" style="margin:0"><input type="text" id="hkw" placeholder="订单号/城市" value="' +
+    esc(kw) + '" style="width:180px"><button id="hgo">查询</button></div></div>' +
+    '<div class="hint">回退需要填写原因，并会记入系统日志。</div>' +
+    (rows.length ? '<table><thead><tr><th>订单号</th><th>线路</th><th>货主</th><th>承运商</th>' +
+      '<th>状态</th><th>最后事件</th><th>操作</th></tr></thead><tbody>' +
+      rows.map(r => '<tr><td>' + esc(r.order_no) + '</td><td>' + esc(r.origin) + '→' + esc(r.dest) +
+        '</td><td>' + esc(r.shipper_org || "-") + '</td><td>' + esc(r.carrier_org || "-") +
+        '</td><td><span class="tag">' + esc(r.status_label) + '</span></td>' +
+        '<td class="muted">' + esc((r.last_event || {}).type || "-") + '</td>' +
+        '<td class="row-actions">' + ((r.can_rollback || []).length
+          ? r.can_rollback.map(t => '<button class="small" data-rb="' + r.id + '" data-to="' + t +
+            '" data-no="' + esc(r.order_no) + '">回退到 ' + esc(t) + '</button>').join("")
+          : "-") + '</td></tr>').join("") + '</tbody></table>'
+      : '<div class="empty">没有符合条件的历史订单</div>') + '</div>';
+
+  $("hgo").onclick = () => { window.__hkw = $("hkw").value; renderHistory(); };
+  $("hkw").addEventListener("keydown", e => { if (e.key === "Enter") $("hgo").click(); });
+  content.querySelectorAll("button[data-rb]").forEach(b => {
+    b.onclick = () => askReason("回退订单 " + b.dataset.no + " → " + b.dataset.to,
+      "回退是运维动作，会记录到系统日志。", async (reason) => {
+        await api("/api/dispatch/orders/" + b.dataset.rb + "/rollback",
+          { method: "POST", body: { target_status: b.dataset.to, reason } });
+        toast("已回退");
+        renderHistory();
+      });
+  });
+}
+
+/* ---------------- 服务费规则 ---------------- */
+async function renderFee() {
+  const d = await api("/api/admin/fee-rules");
+  const a = d.active || {};
+  content.innerHTML =
+    '<div class="stat-row">' +
+    '<div class="stat"><div class="k">当前货主侧费率</div><div class="v">' +
+      (a.shipper_rate != null ? (a.shipper_rate * 100).toFixed(2) + '%' : "-") + '</div></div>' +
+    '<div class="stat"><div class="k">当前承运商侧费率</div><div class="v">' +
+      (a.carrier_rate != null ? (a.carrier_rate * 100).toFixed(2) + '%' : "-") + '</div></div>' +
+    '<div class="stat"><div class="k">生效规则</div><div class="v" style="font-size:14px">' +
+      esc(a.name || "-") + '</div></div></div>' +
+    '<div class="card"><div class="panel-title"><h2>规则历史</h2><span class="spacer"></span>' +
+    (d.can_edit ? '<button class="primary small" id="feeNew">新建规则</button>' : '') + '</div>' +
+    '<div class="hint">' + (d.can_edit ? '新建后对下一单立即生效，旧规则自动归档。'
+      : '如需调整费率，请联系平台管理员。') + '</div>' +
+    '<table><thead><tr><th>名称</th><th>货主侧</th><th>承运商侧</th><th>状态</th>' +
+    '<th>生效时间</th><th>备注</th></tr></thead><tbody>' +
+    (d.items.length ? d.items.map(r => '<tr><td>' + esc(r.name) + '</td><td>' +
+      (r.shipper_rate * 100).toFixed(2) + '%</td><td>' + (r.carrier_rate * 100).toFixed(2) +
+      '%</td><td><span class="tag' + (r.status === "active" ? " ok" : "") + '">' +
+      (r.status === "active" ? "生效中" : "已归档") + '</span></td><td class="muted">' +
+      esc(r.effective_from || "-") + '</td><td class="muted">' + esc(r.note || "-") +
+      '</td></tr>').join("") : '<tr><td colspan="6" class="empty">没有规则</td></tr>') +
+    '</tbody></table></div>';
+
+  if (d.can_edit) $("feeNew").onclick = () => dialog("新建服务费规则",
+    '<label>名称</label><input id="fName" placeholder="例如：2026 年标准费率">' +
+    '<label>货主侧费率（%）</label><input id="fS" type="number" step="0.01" value="2">' +
+    '<label>承运商侧费率（%）</label><input id="fC" type="number" step="0.01" value="2">' +
+    '<label>备注</label><input id="fN" placeholder="可选">',
+    "保存并生效", async () => {
+      await api("/api/admin/fee-rules", { method: "POST", body: {
+        name: $("fName").value.trim() || "未命名规则",
+        shipper_rate: Number($("fS").value) / 100,
+        carrier_rate: Number($("fC").value) / 100,
+        note: $("fN").value.trim() || null,
+      }});
+      toast("已生效");
+      closeDialog();
+      renderFee();
+    });
+}
+
+/* ---------------- 模型与工具 ---------------- */
+async function renderConfig() {
+  const [cfg, creds] = await Promise.all([
+    api("/api/admin/config"), api("/api/admin/credentials?kind=tool"),
+  ]);
+  const chain = cfg.items.find(i => i.key === "model.chain");
+  const enabled = cfg.items.find(i => i.key === "model.enabled");
+  content.innerHTML =
+    '<div class="card"><div class="panel-title"><h2>模型降级链</h2></div>' +
+    '<div class="hint">按从上到下的顺序尝试，前一个不可用时自动降级；保存后立即生效。</div>' +
+    '<label>model.chain</label><textarea class="code" id="cfgChain" rows="5">' +
+      esc(JSON.stringify(chain ? chain.value : {}, null, 2)) + '</textarea>' +
+    '<label>model.enabled（各能力是否允许调模型）</label><textarea class="code" id="cfgEnabled" rows="4">' +
+      esc(JSON.stringify(enabled ? enabled.value : {}, null, 2)) + '</textarea>' +
+    '<div style="margin-top:12px"><button class="primary" id="cfgSave">保存</button> ' +
+    '<span class="muted">保存前会校验 JSON 合法性</span></div></div>' +
+    '<div class="card"><div class="panel-title"><h2>工具凭据</h2><span class="spacer"></span>' +
+    '<button class="small primary" id="credNew">新增凭据</button></div>' +
+    '<div class="hint">留空的字段表示不修改既有值。</div>' +
+    '<table><thead><tr><th>名称</th><th>服务</th><th>字段</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+    ((creds.items || []).length ? creds.items.map((c, i) => '<tr><td>' + esc(c.name) + '</td><td>' +
+      esc(c.service) + '</td><td class="muted">' +
+      esc(Object.keys(c.data || {}).join(", ")) + '</td><td><span class="tag' +
+      (c.enabled ? " ok" : "") + '">' + (c.enabled ? "启用" : "停用") + '</span></td>' +
+      '<td class="row-actions"><button class="small" data-cred="' + i + '">更新</button>' +
+      '<button class="small danger" data-del-cred="' + esc(c.id) + '" data-name="' +
+      esc(c.name) + '">删除</button></td></tr>').join("")
+      : '<tr><td colspan="5" class="empty">没有凭据（可在 data/credentials.json 配置）</td></tr>') +
+    '</tbody></table></div>';
+
+  const openCred = (c) => {
+    const svc = (c && c.service) || (creds.services || [])[0];
+    const fields = (creds.tool_fields || {})[svc] || ["key"];
+    dialog(c ? "更新凭据 " + c.name : "新增工具凭据",
+      '<label>名称</label><input id="crName" value="' + esc(c ? c.name : "") +
+      '" placeholder="例如：高德主账号">' +
+      '<label>服务</label><select id="crSvc">' +
+      (creds.services || []).map(s => '<option' + (s === svc ? " selected" : "") + '>' +
+        esc(s) + '</option>').join("") + '</select>' +
+      fields.map(f => '<label>' + esc(f) + '（留空表示不修改）</label>' +
+        '<input id="cr_' + esc(f) + '" placeholder="不修改则留空">').join(""),
+      "保存", async () => {
+        const data = {};
+        fields.forEach(f => {
+          const v = ($("cr_" + f).value || "").trim();
+          if (v) data[f] = v;
+        });
+        const r = await api("/api/admin/credentials", { method: "POST", body: {
+          kind: "tool", id: c ? c.id : null,
+          name: $("crName").value.trim() || svc,
+          service: $("crSvc").value, enabled: true, data,
+        }});
+        if (r && r.ok === false) { toast(r.error || "保存失败"); return; }
+        toast("已保存");
+        closeDialog();
+        renderConfig();
+      });
+  };
+  if ($("credNew")) $("credNew").onclick = () => openCred(null);
+  content.querySelectorAll("button[data-cred]").forEach(b => {
+    b.onclick = () => openCred((creds.items || [])[Number(b.dataset.cred)]);
+  });
+  content.querySelectorAll("button[data-del-cred]").forEach(b => {
+    b.onclick = () => dialog("删除凭据",
+      '<div class="muted">「' + esc(b.dataset.name) + '」删除后，依赖它的工具调用会立即失败。</div>',
+      "确认删除", async () => {
+        await api("/api/admin/credentials/tool/" + encodeURIComponent(b.dataset.delCred),
+          { method: "DELETE" });
+        toast("已删除");
+        closeDialog();
+        renderConfig();
+      });
+  });
+
+  $("cfgSave").onclick = async () => {
+    let a, b;
+    try { a = JSON.parse($("cfgChain").value); b = JSON.parse($("cfgEnabled").value); }
+    catch (e) { toast("JSON 格式错误：" + e.message); return; }
+    await api("/api/admin/config/model.chain", { method: "PUT", body: { value: a } });
+    await api("/api/admin/config/model.enabled", { method: "PUT", body: { value: b } });
+    toast("已保存并生效");
+    renderConfig();
+  };
+}
+
+/* ---------------- 知识库 ---------------- */
+async function renderKb() {
+  const [st, sops, hist] = await Promise.all([
+    api("/api/dispatch/knowledge/stats"), api("/api/dispatch/knowledge/sops"),
+    api("/api/dispatch/knowledge/history?limit=10").catch(() => []),
+  ]);
+  const sum = sops.summary || {};
+  const items = sops.items || [];
+  content.innerHTML =
+    '<div class="stat-row">' +
+    '<div class="stat"><div class="k">知识块</div><div class="v">' + (st.chunks ?? 0) + '</div></div>' +
+    '<div class="stat"><div class="k">SOP 总数</div><div class="v">' + (sum.total ?? 0) + '</div></div>' +
+    '<div class="stat"><div class="k">向量模型</div><div class="v" style="font-size:14px">' +
+      esc(st.model_in_db || "-") + '</div></div>' +
+    '<div class="stat"><div class="k">一致性</div><div class="v">' +
+      (st.consistent ? '<span class="tag ok">一致</span>' : '<span class="tag danger">需重建</span>') +
+      '</div></div></div>' +
+    '<div class="card"><div class="panel-title"><h2>检索测试</h2><span class="spacer"></span>' +
+    '<button class="small" id="kbRebuild">全量重建</button></div>' +
+    '<div class="toolbar"><input type="text" id="kbQ" placeholder="例如：冷藏车温度超过上限" style="flex:1">' +
+    '<button class="primary" id="kbGo">检索</button></div><div id="kbOut" class="muted"></div></div>' +
+    '<div class="card"><div class="panel-title"><h2>SOP 管理</h2><span class="spacer"></span>' +
+    '<button class="small primary" id="sopNew">新增 SOP</button></div>' +
+    '<div class="hint">共 ' + (sum.total ?? 0) + ' 条（内置 ' + (sum.builtin ?? 0) +
+    '，自定义 ' + (sum.custom ?? 0) + '）。保存后检索索引同步更新。</div>' +
+    '<table><thead><tr><th>SOP</th><th>标题</th><th>等级</th><th>步骤</th><th>来源</th><th>操作</th></tr></thead><tbody>' +
+    (items.length ? items.map(s => '<tr><td class="muted">' + esc(s.sop_id) + '</td><td>' +
+      esc(s.title) + '</td><td><span class="tag">' + esc(s.level || "-") + '</span></td><td>' +
+      ((s.steps || []).length) + ' 步</td><td class="muted">' + esc(s.source || "-") +
+      '</td><td class="row-actions"><button class="small" data-sop="' + esc(s.sop_id) +
+      '">编辑</button><button class="small danger" data-del-sop="' + esc(s.sop_id) +
+      '" data-title="' + esc(s.title) + '">删除</button></td></tr>').join("")
+      : '<tr><td colspan="6" class="empty">没有 SOP</td></tr>') +
+    '</tbody></table></div>' +
+    '<div class="card"><div class="panel-title"><h2>构建记录</h2></div>' +
+    ((hist || []).length
+      ? '<table><thead><tr><th>时间</th><th>动作</th><th>文档</th><th>知识块</th>' +
+        '<th>失败</th><th>向量模型</th><th>维度</th></tr></thead><tbody>' +
+        hist.map(h => '<tr><td class="muted">' + esc(h.at) + '</td><td>' + esc(h.action) +
+          '</td><td>' + (h.docs ?? "-") + '</td><td>' + (h.chunks ?? "-") +
+          '</td><td>' + ((h.failed ?? 0) ? '<span class="tag danger">' + h.failed + '</span>' : "0") +
+          '</td><td class="muted">' + esc(h.model || "-") + '</td><td class="muted">' +
+          (h.dim ?? "-") + '</td></tr>').join("") + '</tbody></table>'
+      : '<div class="empty">还没有构建记录（PG 不可用时这里为空）</div>') + '</div>';
+
+  $("kbGo").onclick = async () => {
+    const q = $("kbQ").value.trim();
+    if (!q) { toast("请输入查询"); return; }
+    $("kbOut").innerHTML = "检索中…";
+    try {
+      const r = await api("/api/dispatch/knowledge/search", { method: "POST", body: { query: q, top_k: 5 } });
+      $("kbOut").innerHTML = '<div class="muted" style="margin:8px 0">渠道：' + esc(r.channel || "-") + '</div>' +
+        (r.hits || []).map(h => '<div style="margin-bottom:12px"><b>' + esc(h.sop_id) + '　' +
+          esc(h.title) + '</b> <span class="tag">' + esc(h.level) + '</span> ' +
+          '<span class="muted">match ' + (h.match ?? "-") + '</span><ol style="margin:6px 0 0 18px;padding:0">' +
+          (h.steps || []).map(s => '<li>' + esc(s) + '</li>').join("") + '</ol></div>').join("");
+    } catch (e) { $("kbOut").textContent = e.message; }
+  };
+  $("kbRebuild").onclick = () => dialog("全量重建知识库",
+    '<div class="muted">会清空旧索引并重新为全部 SOP 生成检索向量，耗时数秒。' +
+    '重建期间检索仍可用，但结果可能来自旧索引。</div>',
+    "开始重建", async () => {
+      const r = await api("/api/dispatch/knowledge/rebuild", { method: "POST" });
+      toast(r.ok ? "重建完成：" + r.result.docs + " 条" : "重建失败：" + (r.error || r.hint));
+      closeDialog();
+      renderKb();
+    });
+
+  const openSop = (s) => dialog(s ? "编辑 SOP " + s.sop_id : "新增 SOP",
+    (s ? '<div class="muted" style="margin-bottom:8px">' + esc(s.sop_id) + '</div>' : '') +
+    '<label>标题</label><input id="spTitle" value="' + esc(s ? s.title : "") + '">' +
+    '<label>等级</label><select id="spLevel">' +
+      ["P0", "P1", "P2", "P3"].map(l => '<option' +
+        (s && s.level === l ? " selected" : "") + '>' + l + '</option>').join("") +
+    '</select>' +
+    '<label>处置步骤（一行一步）</label><textarea id="spSteps" rows="6">' +
+      esc(s ? (s.steps || []).join("\n") : "") + '</textarea>' +
+    '<label>责任方</label><input id="spOwner" value="' + esc(s ? (s.owner || "") : "") + '">' +
+    '<label>通知对象</label><input id="spNotify" value="' + esc(s ? (s.notify || "") : "") + '">',
+    "保存", async () => {
+      const steps = $("spSteps").value.split("\n").map(x => x.trim()).filter(Boolean);
+      if (!steps.length) { toast("至少填写一个处置步骤"); return; }
+      const body = {
+        sop_id: s ? s.sop_id : null,
+        title: $("spTitle").value.trim(),
+        level: $("spLevel").value,
+        steps,
+        owner: $("spOwner").value.trim() || null,
+        notify: $("spNotify").value.trim() || null,
+        category: s ? s.category : null,
+      };
+      if (!body.title) { toast("请填写标题"); return; }
+      const r = await api("/api/dispatch/knowledge/sops", { method: "POST", body });
+      toast(r.pg && r.pg.ok ? "已保存并同步向量" : "已保存（向量同步失败：" +
+        ((r.pg || {}).error || "未知") + "）");
+      closeDialog();
+      renderKb();
+    });
+
+  $("sopNew").onclick = () => openSop(null);
+  content.querySelectorAll("button[data-sop]").forEach(b => {
+    const s = items.find(x => x.sop_id === b.dataset.sop);
+    b.onclick = () => openSop(s);
+  });
+  content.querySelectorAll("button[data-del-sop]").forEach(b => {
+    b.onclick = () => dialog("删除 SOP",
+      '<div class="muted">「' + esc(b.dataset.title || b.dataset.delSop) +
+      '」删除后不再参与检索，该操作会同步清理向量块。</div>',
+      "确认删除", async () => {
+        const r = await api("/api/dispatch/knowledge/sops/" +
+          encodeURIComponent(b.dataset.delSop), { method: "DELETE" });
+        toast(r.pg && r.pg.ok === false ? "已删除，但向量清理失败：" + (r.pg.error || "") : "已删除");
+        closeDialog();
+        renderKb();
+      });
+  });
+}
+
+/* ---------------- 组织与用户 ---------------- */
+async function renderOrgs() {
+  const [carriers, shippers, users] = await Promise.all([
+    api("/api/admin/orgs?org_type=carrier"), api("/api/admin/orgs?org_type=shipper"),
+    has("admin:user") ? api("/api/admin/users") : Promise.resolve([]),
+  ]);
+  const canEditOrg = has("admin:org_manage");
+  content.innerHTML =
+    '<div class="card"><div class="panel-title"><h2>承运商</h2></div>' +
+    '<div class="hint">单价与吨位直接参与收益试算。' + (canEditOrg ? '' : '如需修改请联系平台管理员。') + '</div>' +
+    '<table><thead><tr><th>企业</th><th>联系人</th><th>账号</th><th>单价/公里</th>' +
+    '<th>吨位</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+    (carriers.length ? carriers.map(o => '<tr><td>' + esc(o.name) + '</td><td>' +
+      esc(o.contact_name || "-") + '</td><td class="muted">' +
+      (o.users || []).map(u => u.account).join(", ") + '</td><td>' +
+      money((o.profile || {}).cost_per_km) + '</td><td>' + ((o.profile || {}).capacity_t ?? "-") +
+      ' 吨</td><td><span class="tag' + (o.status ? " ok" : " danger") + '">' +
+      (o.status ? "正常" : "停用") + '</span></td><td class="row-actions">' +
+      (canEditOrg ? '<button class="small" data-car="' + o.id + '" data-cpm="' +
+        ((o.profile || {}).cost_per_km ?? "") + '" data-cap="' +
+        ((o.profile || {}).capacity_t ?? "") + '">成本</button>' +
+        '<button class="small" data-org="' + o.id + '">企业</button>' : "-") +
+      '</td></tr>').join("") : '<tr><td colspan="7" class="empty">无</td></tr>') +
+    '</tbody></table></div>' +
+    '<div class="card"><div class="panel-title"><h2>货主</h2></div>' +
+    '<table><thead><tr><th>企业</th><th>联系人</th><th>账号</th><th>订单数</th><th>状态</th>' +
+    '<th>操作</th></tr></thead><tbody>' +
+    (shippers.length ? shippers.map(o => '<tr><td>' + esc(o.name) + '</td><td>' +
+      esc(o.contact_name || "-") + '</td><td class="muted">' +
+      (o.users || []).map(u => u.account).join(", ") + '</td><td>' + (o.order_count ?? 0) +
+      '</td><td><span class="tag' + (o.status ? " ok" : " danger") + '">' +
+      (o.status ? "正常" : "停用") + '</span></td><td class="row-actions">' +
+      (canEditOrg ? '<button class="small" data-org="' + o.id + '">企业</button>' : "-") +
+      '</td></tr>').join("")
+      : '<tr><td colspan="6" class="empty">无</td></tr>') + '</tbody></table></div>' +
+    (has("admin:user") ? '<div class="card"><div class="panel-title"><h2>用户账号</h2></div>' +
+      '<table><thead><tr><th>账号</th><th>姓名</th><th>角色</th><th>组织</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+      users.map(u => '<tr><td>' + esc(u.account) + '</td><td>' + esc(u.name) + '</td><td><span class="badge-role">' +
+        esc(u.role) + '</span></td><td class="muted">' + esc(u.org_name || "-") + '</td>' +
+        '<td><span class="tag' + (u.status ? " ok" : " danger") + '">' + (u.status ? "正常" : "停用") +
+        '</span></td><td><button class="small" data-usr="' + u.id + '" data-st="' + u.status +
+        '">' + (u.status ? "停用" : "启用") + '</button></td></tr>').join("") +
+      '</tbody></table></div>' : "");
+
+  content.querySelectorAll("button[data-car]").forEach(b => {
+    b.onclick = () => dialog("编辑承运商档案",
+      '<label>每公里成本（元）</label><input id="cpm" type="number" step="0.1" value="' +
+      esc(b.dataset.cpm) + '"><label>可载吨位</label><input id="cap" type="number" step="0.5" value="' +
+      esc(b.dataset.cap) + '">', "保存", async () => {
+        await api("/api/admin/carriers/" + b.dataset.car + "?cost_per_km=" +
+          Number($("cpm").value) + "&capacity_t=" + Number($("cap").value), { method: "PUT" });
+        toast("已保存");
+        closeDialog();
+        renderOrgs();
+      });
+  });
+  content.querySelectorAll("button[data-org]").forEach(b => {
+    const o = carriers.concat(shippers).find(x => String(x.id) === b.dataset.org);
+    if (!o) return;
+    b.onclick = () => dialog("编辑企业信息",
+      '<label>企业名称</label><input id="oName" value="' + esc(o.name) + '">' +
+      '<label>联系人</label><input id="oContact" value="' + esc(o.contact_name || "") + '">' +
+      '<label>状态</label><select id="oStatus">' +
+      '<option value="1"' + (o.status ? " selected" : "") + '>正常</option>' +
+      '<option value="0"' + (o.status ? "" : " selected") + '>停用</option></select>',
+      "保存", async () => {
+        const name = $("oName").value.trim();
+        if (name.length < 2) { toast("企业名称至少 2 个字"); return; }
+        await api("/api/admin/orgs/" + o.id, { method: "PUT", body: {
+          name, contact_name: $("oContact").value.trim() || null,
+          status: Number($("oStatus").value),
+        }});
+        toast("已保存");
+        closeDialog();
+        renderOrgs();
+      });
+  });
+  content.querySelectorAll("button[data-usr]").forEach(b => {
+    b.onclick = () => askReason(
+      (b.dataset.st === "1" ? "停用" : "启用") + "账号",
+      b.dataset.st === "1" ? "停用后该账号无法登录。" : "恢复该账号登录能力。",
+      async () => {
+        const to = b.dataset.st === "1" ? 0 : 1;
+        await api("/api/admin/users/" + b.dataset.usr, { method: "PUT", body: { status: to } });
+        toast("已更新");
+        renderOrgs();
+      });
+  });
+}
+
+/* ---------------- 系统日志 ---------------- */
+async function renderLogs() {
+  const kw = (window.__lkw || "").trim();
+  const d = await api("/api/dispatch/audit" + (kw ? "?keyword=" + encodeURIComponent(kw) : ""));
+  content.innerHTML =
+    '<div class="card"><div class="panel-title"><h2>系统日志</h2><span class="spacer"></span>' +
+    '<div class="toolbar" style="margin:0"><input type="text" id="lkw" placeholder="账号/单号/原因" value="' +
+    esc(kw) + '" style="width:180px"><button id="lgo">查询</button></div></div>' +
+    '<div class="hint">记录取消、回退、费率与配置变更，按时间倒序排列。</div>' +
+    '<table><thead><tr><th>时间</th><th>操作人</th><th>角色</th><th>动作</th><th>对象</th>' +
+    '<th>原因</th></tr></thead><tbody>' +
+    ((d.items || []).length ? d.items.map(i => '<tr><td class="muted">' + esc(i.at) + '</td><td>' +
+      esc(i.actor || "-") + '</td><td><span class="badge-role">' + esc(i.role) + '</span></td><td>' +
+      esc(i.action) + '</td><td class="muted">' + esc((i.target_type || "") + " " +
+      (i.target_id || "")) + '</td><td>' + esc(i.reason || "-") + '</td></tr>').join("")
+      : '<tr><td colspan="6" class="empty">暂无日志</td></tr>') +
+    '</tbody></table></div>';
+
+  $("lgo").onclick = () => { window.__lkw = $("lkw").value; renderLogs(); };
+  $("lkw").addEventListener("keydown", e => { if (e.key === "Enter") $("lgo").click(); });
+}
+
+/* ---------------- 启动 ---------------- */
+buildNav();
+const first = PANELS.find(p => has(p.perm));
+if (first) first.render().catch(e => { content.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; });
+else content.innerHTML = '<div class="empty">当前账号没有可访问的调度功能</div>';
+</script>
+</body>
+</html>

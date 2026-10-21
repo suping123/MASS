@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>承运商端 · 找单与接单</title>
+<link rel="stylesheet" href="/app.css?v=20261018g">
+</head>
+<body>
+<div class="wrap">
+  <header class="page-head">
+    <div class="page-head-main">
+      <h1>公共订单池</h1>
+      <p>接单前先把账算清：运费扣掉平台服务费、干线成本，以及从你当前位置空车过去的成本，剩下的才是这一单能落袋的钱。</p>
+      <div class="page-chips">
+        <span class="chip">收益含空驶成本</span>
+        <span class="chip">接单需自报位置</span>
+        <span class="chip">途中可随时上报</span>
+      </div>
+    </div>
+    <div class="hero-graphic" aria-hidden="true">
+      <span class="hg-dot"></span><span class="hg-line"></span>
+      <span class="hg-dot mid"></span><span class="hg-line"></span>
+      <span class="hg-dot end"></span>
+    </div>
+  </header>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="panel-title"><h2>可接订单</h2><span class="spacer"></span>
+        <button class="small" id="refreshPool">刷新</button></div>
+      <div id="pool"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="card">
+      <div class="panel-title"><h2>跟订单助手对话</h2></div>
+      <div class="chat" id="chat" style="height:398px"></div>
+      <div class="ag-chips" id="quick"></div>
+      <div class="chat-input">
+        <input id="text" placeholder="例如：算一下 SO20261017000123 能赚多少">
+        <button class="primary" id="send">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <div class="panel-title"><h2>我的竞价</h2>
+      <span class="muted" style="font-size:12px">报过的价、谈了几轮、最后中没中</span></div>
+    <div id="bids"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="grid2" style="margin-top:16px">
+    <div class="card">
+      <div class="panel-title"><h2>我的运单</h2></div>
+      <div id="mine"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="card">
+      <div class="panel-title"><h2>我的承运档案</h2><span class="spacer"></span>
+        <button class="small" id="editProfile">修改</button></div>
+      <div id="profBody"><div class="empty">加载中…</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="mask">
+  <div class="modal">
+    <h3 id="mTitle">接单</h3>
+    <div class="kv" id="mInfo"></div>
+    <label id="mLabel">你现在的出发位置（文本）</label>
+    <input id="mInput" placeholder="例如：石家庄正定物流园">
+    <div class="row">
+      <button id="cancel">取消</button>
+      <button class="primary" id="ok">确认</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js?v=20261018g"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const user = Auth.require("carrier");
+mountTopbar("承运商端 · 找单与接单");
+const chat = $("chat");
+let sessionId = null;
+let pending = null;   // { kind: "accept"|"quote", orderId }
+let profile = null;
+
+pushMsg(chat, "agent", "你好，我是承运订单助手。可以帮你查单、算收益、接单，行程中有情况也可以直接跟我说。");
+
+function tagOf(s) { return STATUS_TONE[s] || ""; }
+
+/* ---------------- 可接订单 ---------------- */
+function renderPool(rows) {
+  const box = $("pool");
+  if (!rows.length) { box.innerHTML = '<div class="empty">暂时没有可接的单</div>'; return; }
+  box.innerHTML = '<table><thead><tr><th>订单号</th><th>线路</th><th>货物</th><th>里程</th>' +
+    '<th>空驶</th><th>运费</th><th>预估收益</th><th>竞价</th><th></th></tr></thead><tbody>' +
+    rows.map(r => {
+      // 竞价状态放在列表里而不是藏在详情：还有多久截止、我报过没有，
+      // 这两件事决定"现在点了会不会白跑"。
+      let tender;
+      if (r.my_bid) {
+        tender = '<b>' + money(r.my_bid.quote) + '</b>' +
+          '<div class="muted" style="font-size:11.5px">已报价 · 第 ' + (r.my_bid.round || 1) + ' 轮</div>';
+      } else if (r.tender_open && r.tender_deadline_at) {
+        const left = Math.round((new Date(r.tender_deadline_at).getTime() - Date.now()) / 1000);
+        tender = '<span class="cnt' + (left < 0 ? " over" : (left < 600 ? " hot" : "")) + '">' +
+          countdown(left) + "</span>";
+      } else {
+        tender = '<span class="muted">未开标</span>';
+      }
+      return '<tr><td>' + esc(r.order_no) + '</td><td>' + esc(r.origin) + '→' + esc(r.dest) +
+        '</td><td>' + esc(r.cargo_type) + ' ' + (r.weight_t ?? "-") + '吨' +
+        (r.temp_ctrl ? ' <span class="tag">温控</span>' : '') + '</td>' +
+        '<td>' + (r.distance_km ?? "-") + ' km</td>' +
+        '<td class="muted">' + (r.deadhead_km ? r.deadhead_km + ' km' : "-") + '</td>' +
+        '<td>' + money(r.publish_price) + '</td>' +
+        '<td class="money-strong">' + (r.quick_profit === undefined ? "-" : money(r.quick_profit)) + '</td>' +
+        '<td>' + tender + '</td>' +
+        '<td class="row-actions"><button class="small" data-q="' + r.order_id + '">算收益</button>' +
+        '<button class="small' + (r.my_bid ? "" : " primary") + '" data-b="' + r.order_id + '">' +
+        (r.my_bid ? "改报价" : "报价") + '</button>' +
+        '<button class="small primary" data-a="' + r.order_id + '">接单</button></td></tr>';
+    }).join("") +
+    '</tbody></table>';
+  box.querySelectorAll("button[data-q]").forEach(b => {
+    b.onclick = () => askQuote(Number(b.dataset.q));
+  });
+  box.querySelectorAll("button[data-b]").forEach(b => {
+    b.onclick = () => askBid(Number(b.dataset.b), rows);
+  });
+  box.querySelectorAll("button[data-a]").forEach(b => {
+    b.onclick = () => askAccept(Number(b.dataset.a), rows);
+  });
+}
+
+/* ---------------- 我的竞价 ---------------- */
+function renderBids(rows) {
+  const box = $("bids");
+  if (!rows || !rows.length) {
+    box.innerHTML = '<div class="empty">还没有报过价。订单池里点「报价」，' +
+      '把运费和承诺时效填进去——调度会拿它和其他承运商比。</div>';
+    return;
+  }
+  box.innerHTML = '<table><thead><tr><th>订单号</th><th>线路</th><th>我的报价</th>' +
+    '<th>承诺时效</th><th>竞争</th><th>招标状态</th><th>结果</th><th></th></tr></thead><tbody>' +
+    rows.map(r => {
+      const res = r.result
+        ? (r.won ? '<b style="color:var(--ok)">你中标了</b>' : '<span class="muted">' + esc(r.result) + '</span>')
+        : (r.awaiting_me ? '<span class="tag warn">等你回应还价</span>' : '<span class="muted">等裁决</span>');
+      return '<tr><td>' + esc(r.order_no) + '</td><td>' + esc(r.origin) + '→' + esc(r.dest) +
+        '</td><td><b>' + money(r.quote) + '</b>' +
+          (r.round > 1 ? ' <span class="muted">第 ' + r.round + ' 轮</span>' : "") + '</td>' +
+        '<td>' + (r.eta_h ? Number(r.eta_h).toFixed(1) + ' h' : "-") + '</td>' +
+        '<td class="cnt">' + (r.bid_count || 0) + ' 家</td>' +
+        '<td>' + (r.tender_status ? tenderTag(r.tender_status, r.tender_status_label) : "-") + '</td>' +
+        '<td>' + res + '</td>' +
+        '<td class="row-actions"><button class="small" data-view="' + r.order_id + '">详情</button></td></tr>';
+    }).join("") + "</tbody></table>";
+  box.querySelectorAll("button[data-view]").forEach(b => {
+    b.onclick = () => openBid(Number(b.dataset.view));
+  });
+}
+
+// 承运商看自己的竞价：我的价、我的底线（档案单价与空驶决定）、谈了几轮。
+// 别家的报价在这里**不存在**——只有"有几家在争"。
+async function openBid(id) {
+  try {
+    const t = await api("/api/carrier/orders/" + id + "/tender");
+    if (!t.ok) { toast(t.reason || "这单没有招标记录"); return; }
+    const mine = t.my_bid || {};
+    const hist = (mine.history || []).map(h =>
+      "<li><span class=\"tl-dot\"></span><div class=\"tl-main\"><b>" + money(h.amount) + "</b>" +
+      '<span class="tl-actor">第 ' + (h.round || 1) + " 轮" +
+      (h.auto ? " · 系统按底线算的" : " · 你填的") + "</span>" +
+      (h.floor != null ? '<div class="tl-note">成本底线 ' + money(h.floor) + "（低于这个价就是亏）</div>" : "") +
+      (h.at ? '<div class="tl-time">' + esc(h.at) + "</div>" : "") +
+      "</div></li>").join("");
+
+    const body =
+      '<div class="detail-hero"><div class="dh-main">' +
+        '<div class="dh-no">' + esc(t.tender_id ? "招标 #" + t.tender_id : "招标") + "</div>" +
+        '<div class="dh-sub">' + (t.result ? esc(t.result) : "招标进行中") + "</div>" +
+      "</div>" + tenderTag(t.status, t.status_label) + "</div>" +
+
+      detailSection("我这边的数",
+        kvGrid([
+          ["我的报价", mine.quote != null ? money(mine.quote) : "-"],
+          ["承诺时效", mine.eta_h ? Number(mine.eta_h).toFixed(1) + " h" : "-"],
+          ["当前轮次", "第 " + (mine.round || 1) + " 轮"],
+          ["竞争家数", (t.bid_count || 0) + " 家"],
+        ]) +
+        (t.deadline_at ? '<div class="muted" style="margin-top:8px">收标截止 ' +
+          esc(t.deadline_at) + "</div>" : "")) +
+
+      detailSection("我的报价历史", hist ? '<ol class="tl">' + hist + "</ol>"
+        : '<div class="empty">还没有报过价</div>') +
+
+      ((t.negotiation && (t.negotiation.turns || []).length)
+        ? detailSection("调度的还价（只有被谈的那家看得到）", negTimeline(t.negotiation))
+        : "");
+
+    openDrawer("我的竞价", body);
+  } catch (e) { toast(e.message); }
+}
+
+/* ---------------- 我的运单 ---------------- */
+function renderMine(rows) {
+  const box = $("mine");
+  if (!rows.length) { box.innerHTML = '<div class="empty">还没有接过单</div>'; return; }
+  box.innerHTML = '<table><thead><tr><th>订单号</th><th>线路</th><th>状态</th>' +
+    '<th>预估收益</th><th>我的位置</th><th></th></tr></thead><tbody>' +
+    rows.map(r => '<tr><td><button class="link" data-open="' + r.order_id + '">' +
+      esc(r.order_no) + '</button></td><td>' + esc(r.origin) + ' → ' + esc(r.dest) +
+      '</td><td>' + statusTag(r.status, r.status_label) + '</td>' +
+      '<td class="money-strong">' + money(r.est_profit) + '</td>' +
+      '<td>' + esc(r.position_text || "-") + '</td>' +
+      '<td class="row-actions">' +
+        '<button class="small" data-open2="' + r.order_id + '">详情</button>' +
+        (["published", "candidate", "claimed", "in_transit", "exception"].includes(r.status)
+          ? '<button class="small danger" data-cancel="' + r.order_id + '" data-no="' +
+            esc(r.order_no) + '">放弃</button>' : "") +
+      '</td></tr>').join("") +
+    '</tbody></table>';
+
+  const open = (id) => openOrder(id);
+  box.querySelectorAll("button[data-open]").forEach(b => b.onclick = () => open(Number(b.dataset.open)));
+  box.querySelectorAll("button[data-open2]").forEach(b => b.onclick = () => open(Number(b.dataset.open2)));
+  box.querySelectorAll("button[data-cancel]").forEach(b => {
+    b.onclick = async () => {
+      const reason = await askReason("放弃承运 " + b.dataset.no,
+        "放弃后该订单会退回订单池，调度方会重新安排。");
+      if (!reason) return;
+      b.disabled = true;
+      try {
+        await api("/api/carrier/orders/" + b.dataset.cancel + "/cancel",
+          { method: "POST", body: { reason } });
+        toast("已放弃");
+        loadAll();
+      } catch (e) { toast(e.message); b.disabled = false; }
+    };
+  });
+}
+
+/* ---------------- 运单详情 ---------------- */
+function routeChain(d) {
+  const wp = (d.plan && d.plan.waypoints) || [];
+  if (!wp.length) {
+    return '<div class="route-chain"><span class="rc-node end">' + esc(d.origin) +
+      '</span><span class="rc-sep">→</span><span class="rc-node end">' + esc(d.dest) + '</span></div>';
+  }
+  return '<div class="route-chain">' + wp.map((n, i) => {
+    const end = i === 0 || i === wp.length - 1;
+    return '<span class="rc-node' + (end ? " end" : "") + '">' + esc(n) + '</span>' +
+      (i < wp.length - 1 ? '<span class="rc-sep">→</span>' : "");
+  }).join("") + '</div>';
+}
+
+async function openOrder(id) {
+  try {
+    const d = await api("/api/carrier/orders/" + id);
+    // 竞价信息拿不到（老单没招标）不该让整个详情失败
+    let t = null;
+    try { t = await api("/api/carrier/orders/" + id + "/tender"); } catch (e) { t = null; }
+    const b = d.bid || {};
+    const moneyItems = [];
+    if (b.quoted_price != null) moneyItems.push({ label: "运费", value: money(b.quoted_price) });
+    if (b.est_fee != null) moneyItems.push({ label: "平台服务费", value: "−" + money(b.est_fee) });
+    if (b.linehaul_cost != null) moneyItems.push({ label: "干线成本", value: "−" + money(b.linehaul_cost) });
+    if (b.deadhead_cost != null) {
+      moneyItems.push({
+        label: "空驶成本", value: "−" + money(b.deadhead_cost),
+        note: (b.deadhead_km ?? 0) + " km" + (b.deadhead_from ? "（从 " + b.deadhead_from + " 出发）" : ""),
+      });
+    }
+    if (b.est_profit != null) {
+      moneyItems.push({
+        label: "这一单实际能挣", value: money(b.est_profit), strong: true,
+        tone: b.est_profit >= 0 ? "pos" : "neg",
+      });
+    }
+
+    const plan = d.plan || {};
+    const body =
+      '<div class="detail-hero"><div class="dh-main">' +
+        '<div class="dh-no">' + esc(d.order_no) + '</div>' +
+        '<div class="dh-sub">' + esc(d.origin) + " → " + esc(d.dest) + '</div>' +
+      '</div>' + statusTag(d.status, d.status_label) + '</div>' +
+
+      detailSection("收益构成",
+        moneyItems.length ? amountList(moneyItems)
+          : '<div class="muted">还没有接单记录</div>') +
+
+      ((t && t.ok)
+        ? detailSection("竞价",
+            kvGrid([
+              ["招标状态", tenderTag(t.status, t.status_label) +
+                (t.result ? "　" + esc(t.result) : "")],
+              ["我的报价", t.my_bid && t.my_bid.quote != null ? money(t.my_bid.quote) : "-"],
+              // 协商成交时"我报了多少"与"最后成交多少"是两个数，两个都要给
+              ...(t.my_bid && t.my_bid.final_quote != null
+                ? [["成交价", money(t.my_bid.final_quote)]] : []),
+              ["竞争家数", (t.bid_count || 0) + " 家"],
+            ]) +
+            (((t.negotiation || {}).turns || []).length
+              ? '<div style="margin-top:10px">' + negTimeline(t.negotiation) + "</div>" : ""))
+        : "") +
+
+      detailSection("路线", routeChain(d) +
+        (plan.distance_km ? '<div class="muted" style="margin-top:8px">全程 ' + plan.distance_km +
+          ' km · 预计 ' + (plan.eta_h ?? "-") + ' 小时</div>' : '')) +
+
+      detailSection("货物", kvGrid([
+        ["货类", esc(d.cargo_type)],
+        ["重量", (d.weight_t ?? "-") + " 吨"],
+        ["温控", d.temp_ctrl ? "需要" : "不需要"],
+        ["危险品", d.hazmat ? "是" : "否"],
+        ["要求送达", esc(d.required_by || "-")],
+      ])) +
+
+      detailSection("装卸联系", kvGrid([
+        ["联系人", esc(d.contact_name || "-")],
+        ["联系电话", esc(d.contact_phone || "-")],
+        ["接单时间", esc(b.decided_at || "-")],
+        ["接单位置", esc(b.position_text || "-")],
+      ])) +
+
+      detailSection("流转记录", eventTimeline(d.events));
+
+    openDrawer("运单详情", body);
+  } catch (e) { toast(e.message); }
+}
+
+/* ---------------- 承运档案 ---------------- */
+function renderProfile(p) {
+  profile = p;
+  if (!p) {
+    $("profBody").innerHTML = '<div class="empty">没有承运档案</div>';
+    $("editProfile").style.display = "none";
+    return;
+  }
+  $("editProfile").style.display = "";
+  $("profBody").innerHTML = amountList([
+    { label: "每公里成本", value: money(p.cost_per_km), strong: false },
+    { label: "可载吨位", value: (p.capacity_t ?? "-") + " 吨" },
+    { label: "当前位置", value: esc(p.current_position || "未登记") },
+    { label: "完成单量", value: (p.completed_orders ?? 0) + " 单" },
+  ]) + (p.position_updated_at
+    ? '<div class="muted" style="margin-top:8px">位置更新于 ' + esc(p.position_updated_at) + '</div>' : "");
+}
+
+$("editProfile").onclick = () => {
+  const p = profile || {};
+  const body =
+    detailSection("成本参数", '<div class="muted" style="margin-bottom:10px">' +
+      '每公里成本直接参与收益试算，填真实值才能算准。</div>' +
+      '<label>每公里成本（元）</label><input id="pCpm" type="number" step="0.1" min="0.1" value="' +
+      (p.cost_per_km ?? "") + '">' +
+      '<label>可载吨位</label><input id="pCap" type="number" step="0.5" min="0.5" value="' +
+      (p.capacity_t ?? "") + '">' +
+      '<label>当前位置</label><input id="pPos" placeholder="例如：石家庄正定物流园" value="' +
+      esc(p.current_position || "") + '">');
+  const mask = openDrawer("修改承运档案", body,
+    '<button data-drawer-close="1">取消</button><button class="primary" id="pSave">保存</button>');
+  mask.querySelector("#pSave").onclick = async () => {
+    const payload = {};
+    const cpm = Number($("pCpm").value), cap = Number($("pCap").value);
+    if (cpm > 0) payload.cost_per_km = cpm;
+    if (cap > 0) payload.capacity_t = cap;
+    const pos = $("pPos").value.trim();
+    if (pos) payload.current_position = pos;
+    try {
+      await api("/api/carrier/profile", { method: "PUT", body: payload });
+      toast("已保存");
+      closeDrawer();
+      loadAll();
+    } catch (e) { toast(e.message); }
+  };
+};
+
+/* ---------------- 加载 ---------------- */
+async function loadAll() {
+  try { renderPool(await api("/api/carrier/pool")); }
+  catch (e) { $("pool").innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+  try { renderBids(await api("/api/carrier/my-bids")); }
+  catch (e) { $("bids").innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+  try { renderMine(await api("/api/carrier/orders")); }
+  catch (e) { $("mine").innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+  try { renderProfile(await api("/api/carrier/profile")); }
+  catch (e) { $("profBody").innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; }
+}
+
+// 收益卡是动态插入的兄弟节点，重复打开弹窗时要先清掉，避免叠多张
+function clearProfitHero() {
+  document.querySelectorAll(".profit-hero").forEach(el => el.remove());
+}
+
+async function askQuote(id) {
+  try {
+    const q = await api("/api/carrier/orders/" + id + "/quote", { method: "POST" });
+    clearProfitHero();
+    $("mTitle").textContent = "收益试算";
+    $("mLabel").style.display = "none";
+    $("mInput").style.display = "none";
+    $("mInfo").innerHTML =
+      '<div class="k">订单</div><div>' + esc(q.order_no) + '</div>' +
+      '<div class="k">运费</div><div>' + money(q.quoted_price) + '</div>' +
+      '<div class="k">平台服务费</div><div>' + money(q.carrier_fee) + '</div>' +
+      '<div class="k">干线成本</div><div>' + money(q.linehaul_cost) +
+        ' <span class="muted">' + q.distance_km + 'km × ' + q.cost_per_km + '</span></div>' +
+      '<div class="k">空驶成本</div><div>' + money(q.deadhead_cost) +
+        ' <span class="muted">' + (q.deadhead_km || 0) + 'km × ' + q.cost_per_km + '</span>' +
+        (q.deadhead_note ? '<div class="muted">未计原因：' + esc(q.deadhead_note) + '</div>' : '') +
+        '</div>';
+    const hero = document.createElement("div");
+    hero.className = "profit-hero";
+    hero.innerHTML = '<span>这一单实际能挣</span><b>' + money(q.profit) + '</b>';
+    $("mInfo").after(hero);
+    pending = { kind: "none", orderId: id };
+    $("ok").style.display = "none";
+    $("mask").classList.add("show");
+    loadAll();
+  } catch (e) { toast(e.message); }
+}
+
+function askAccept(id, rows) {
+  const r = rows.find(x => x.order_id === id);
+  clearProfitHero();
+  $("mTitle").textContent = "确认接单";
+  $("mLabel").style.display = "";
+  $("mInput").style.display = "";
+  $("mInput").value = (profile && profile.current_position) || "";
+  $("ok").style.display = "";
+  $("mInfo").innerHTML =
+    '<div class="k">订单</div><div>' + esc(r.order_no) + '</div>' +
+    '<div class="k">线路</div><div>' + esc(r.origin) + ' → ' + esc(r.dest) + '</div>' +
+    '<div class="k">运费</div><div>' + money(r.publish_price) + '</div>' +
+    (r.deadhead_km ? '<div class="k">空驶</div><div>' + r.deadhead_km +
+      ' km <span class="muted">（到你当前位置）</span></div>' : '') +
+    '<div class="k">预估收益</div><div><b>' + money(r.quick_profit) + '</b></div>';
+  pending = { kind: "accept", orderId: id };
+  $("mask").classList.add("show");
+}
+
+// 报价（投标）：价格由承运商自己填，平台只负责比价与记账。
+// 默认值取"可付运费"，不是替他做决定——多数人会在此基础上上浮或下压。
+function askBid(id, rows) {
+  const r = rows.find(x => x.order_id === id) || {};
+  clearProfitHero();
+  $("mTitle").textContent = r.my_bid ? "改报价" : "报价（投标）";
+  $("mLabel").style.display = "none";
+  $("mInput").style.display = "none";
+  $("ok").style.display = "";
+  const base = r.my_bid ? r.my_bid.quote : r.publish_price;
+  $("mInfo").innerHTML =
+    '<div class="k">订单</div><div>' + esc(r.order_no) + '</div>' +
+    '<div class="k">线路</div><div>' + esc(r.origin) + ' → ' + esc(r.dest) + '</div>' +
+    '<div class="k">可付运费</div><div>' + money(r.publish_price) + '</div>' +
+    (r.quick_profit !== undefined
+      ? '<div class="k">按这个价能挣</div><div><b>' + money(r.quick_profit) + '</b></div>' : '') +
+    '<label>你的报价（运费，元）</label>' +
+    '<input id="bAmount" type="number" step="1" min="1" value="' + (base ?? "") + '">' +
+    '<label>承诺时效（小时）</label>' +
+    '<input id="bEta" type="number" step="0.5" min="1" value="' + (r.eta_h ?? "") + '">' +
+    '<div class="muted" style="margin-top:8px">报价是你要的运费（还没扣平台服务费）。' +
+    '低于成本底线会被自己的 agent 拒绝——赔本的单一律不该接。</div>';
+  pending = { kind: "bid", orderId: id };
+  $("mask").classList.add("show");
+}
+
+$("cancel").onclick = () => {
+  $("mask").classList.remove("show");
+  const h = document.querySelector(".profit-hero");
+  if (h) h.remove();
+  pending = null;
+};
+$("ok").onclick = async () => {
+  if (!pending) return;
+  if (pending.kind === "bid") {
+    const amount = Number(($("bAmount") || {}).value || 0);
+    const eta = Number(($("bEta") || {}).value || 0);
+    if (!(amount > 0)) { toast("请填写你的报价"); return; }
+    if (!(eta > 0)) { toast("请填写承诺时效"); return; }
+    $("ok").disabled = true;
+    try {
+      const r = await api("/api/carrier/orders/" + pending.orderId + "/bid", {
+        method: "POST", body: { quote_amount: amount, eta_h: eta },
+      });
+      // 投标**不改订单状态**：这点要明说，否则承运商会以为报完价就算接了单
+      toast("已报价 " + money(r.quote) + "（第 " + (r.bid_round || 1) +
+        " 轮），等调度裁决");
+      $("mask").classList.remove("show");
+      pending = null;
+      loadAll();
+    } catch (e) { toast(e.message); }
+    finally { $("ok").disabled = false; }
+    return;
+  }
+  if (pending.kind !== "accept") return;
+  const pos = $("mInput").value.trim();
+  if (pos.length < 2) { toast("请填写你的当前位置"); return; }
+  $("ok").disabled = true;
+  try {
+    const r = await api("/api/carrier/orders/" + pending.orderId + "/accept", {
+      method: "POST", body: { position_text: pos },
+    });
+    toast("接单成功，预估收益 " + money(r.profit));
+    $("mask").classList.remove("show");
+    pending = null;
+    loadAll();
+  } catch (e) { toast(e.message); }
+  finally { $("ok").disabled = false; }
+};
+
+/* ---------------- 对话 ---------------- */
+async function send() {
+  const t = $("text").value.trim();
+  if (!t) return;
+  $("text").value = "";
+  pushMsg(chat, "user", t);
+  $("send").disabled = true;
+  try {
+    const r = await api("/api/carrier/chat", {
+      method: "POST", body: { session_id: sessionId, text: t },
+    });
+    sessionId = r.session_id;
+    pushMsg(chat, "agent", r.reply);
+    if (r.done) {
+      pushMsg(chat, "sys", "本会话已结束。");
+      sessionId = null;
+      loadAll();
+    }
+  } catch (e) {
+    pushMsg(chat, "sys", "出错了：" + e.message);
+  } finally {
+    $("send").disabled = false;
+    $("text").focus();
+  }
+}
+
+const QUICK = [
+  ["冷链能拉吗", "冷链货物能拉吗"],
+  ["收益怎么算", "这单收益怎么算"],
+  ["危险品资质", "危险品运输需要什么资质"],
+];
+(function mountQuick() {
+  const box = $("quick");
+  if (!box) return;
+  box.innerHTML = QUICK.map((q, i) =>
+    '<button class="ag-chip" data-q="' + i + '">' + esc(q[0]) + "</button>").join("");
+  box.querySelectorAll("button[data-q]").forEach(b => {
+    b.onclick = () => { $("text").value = QUICK[Number(b.dataset.q)][1]; send(); };
+  });
+})();
+
+$("send").onclick = send;
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+$("refreshPool").onclick = loadAll;
+loadAll();
+</script>
+</body>
+</html>

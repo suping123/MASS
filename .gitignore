@@ -1,0 +1,37 @@
+# ===== secrets / local config（绝不提交）=====
+.env
+.env.local
+data/.jwt_secret
+data/credentials.json
+
+# ===== python 依赖与编译缓存 =====
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== WorkBuddy 本地会话数据（个人，绝不提交）=====
+.workbuddy/
+
+# ===== 运行期产物 / 业务数据（代码可自动重建，且含会话等敏感数据）=====
+data/
+logs/
+results/
+*.log
+
+# ===== 打包 / 压缩产物 =====
+*.zip
+*.tar.gz
+*.rar
